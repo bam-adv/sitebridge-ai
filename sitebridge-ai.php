@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.7.1
+ * Version:     1.7.2
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.7.1' );
+define( 'SITEBRIDGE_VERSION', '1.7.2' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -594,6 +594,23 @@ function sitebridge_admin_redirects_page() {
 			$src = trim( sanitize_text_field( wp_unslash( $_POST['source'] ) ) );
 			sitebridge_redirects_remove( $src );
 			$notice = 'Redirect deleted.';
+		} elseif ( $_POST['sitebridge_action'] === 'import' ) {
+			$csv = '';
+			if ( ! empty( $_FILES['csv_file']['tmp_name'] ) && is_uploaded_file( $_FILES['csv_file']['tmp_name'] ) ) {
+				$csv = file_get_contents( $_FILES['csv_file']['tmp_name'] );
+			} elseif ( ! empty( $_POST['csv_text'] ) ) {
+				$csv = wp_unslash( $_POST['csv_text'] );
+			}
+			$entries = ( $csv !== '' ) ? sitebridge_redirects_parse_csv( $csv ) : array();
+			if ( ! empty( $entries ) ) {
+				if ( ! empty( $_POST['replace_all'] ) ) {
+					update_option( SITEBRIDGE_REDIRECTS_OPTION, array() );
+				}
+				$res    = sitebridge_redirects_import( $entries );
+				$notice = sprintf( 'Imported: %d added, %d updated, %d skipped (%d total).', $res['added'], $res['updated'], $res['skipped'], $res['total'] );
+			} else {
+				$notice = 'No valid rows found — upload a CSV file or paste rows (source,target,type).';
+			}
 		}
 	}
 
@@ -631,6 +648,17 @@ function sitebridge_admin_redirects_page() {
 				</tr>
 			</table>
 			<?php submit_button( 'Save redirect' ); ?>
+		</form>
+
+		<h2>Bulk import (CSV)</h2>
+		<form method="post" enctype="multipart/form-data">
+			<?php wp_nonce_field( 'sitebridge_redirects' ); ?>
+			<input type="hidden" name="sitebridge_action" value="import" />
+			<p class="description">Upload a <code>.csv</code> file or paste rows below — <code>source,target,type</code> per line (type optional, defaults to 301; a header row is fine).</p>
+			<p><input type="file" name="csv_file" accept=".csv,text/csv" /></p>
+			<p><textarea name="csv_text" rows="6" class="large-text code" placeholder="/old-page/,/new-page/,301&#10;/legacy-url/,https://example.com/new/,301"></textarea></p>
+			<p><label><input type="checkbox" name="replace_all" value="1" /> Replace all existing redirects first (wipe before import)</label></p>
+			<?php submit_button( 'Import CSV', 'secondary' ); ?>
 		</form>
 
 		<h2>Current redirects (<?php echo count( $redirects ); ?>)</h2>
