@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.7.2
+ * Version:     1.8.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.7.2' );
+define( 'SITEBRIDGE_VERSION', '1.8.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -368,6 +368,30 @@ function sitebridge_redirects_norm_path( $url ) {
 	return strtolower( $path === '' ? '/' : $path );
 }
 
+/** If a source uses the "regex:" prefix, return the bare pattern; else null. */
+function sitebridge_redirects_regex_pattern( $source ) {
+	$source = (string) $source;
+	if ( stripos( $source, 'regex:' ) === 0 ) {
+		return substr( $source, 6 );
+	}
+	return null;
+}
+
+/** True when a regex pattern compiles. */
+function sitebridge_redirects_regex_valid( $pattern ) {
+	$d = chr( 1 );
+	return @preg_match( $d . str_replace( $d, '', (string) $pattern ) . $d, '' ) !== false;
+}
+
+/** Dedupe key for an entry: normalized path for exact rules, verbatim pattern for regex rules. */
+function sitebridge_redirects_key( $source ) {
+	$pattern = sitebridge_redirects_regex_pattern( $source );
+	if ( $pattern !== null ) {
+		return 'regex:' . $pattern;
+	}
+	return sitebridge_redirects_norm_path( $source );
+}
+
 function sitebridge_redirects_all() {
 	$r = get_option( SITEBRIDGE_REDIRECTS_OPTION, array() );
 	return is_array( $r ) ? $r : array();
@@ -377,11 +401,18 @@ function sitebridge_redirects_all() {
 function sitebridge_redirects_save( $source, $target, $type = 301 ) {
 	$type = in_array( (int) $type, array( 301, 302, 307, 308 ), true ) ? (int) $type : 301;
 	$redirects = sitebridge_redirects_all();
-	$key   = sitebridge_redirects_norm_path( $source );
+	$pattern = sitebridge_redirects_regex_pattern( $source );
+	if ( $pattern !== null && ! sitebridge_redirects_regex_valid( $pattern ) ) {
+		return array( 'error' => 'invalid_regex', 'entry' => null, 'updated' => false, 'count' => count( $redirects ) );
+	}
+	$key   = sitebridge_redirects_key( $source );
 	$entry = array( 'source' => $source, 'target' => $target, 'type' => $type, 'created' => current_time( 'mysql' ) );
+	if ( $pattern !== null ) {
+		$entry['regex'] = true;
+	}
 	$replaced = false;
 	foreach ( $redirects as $i => $r ) {
-		if ( sitebridge_redirects_norm_path( isset( $r['source'] ) ? $r['source'] : '' ) === $key ) {
+		if ( sitebridge_redirects_key( isset( $r['source'] ) ? $r['source'] : '' ) === $key ) {
 			$redirects[ $i ] = $entry;
 			$replaced = true;
 			break;
@@ -397,10 +428,10 @@ function sitebridge_redirects_save( $source, $target, $type = 301 ) {
 /** Shared delete logic. Returns number removed. */
 function sitebridge_redirects_remove( $source ) {
 	$redirects = sitebridge_redirects_all();
-	$key    = sitebridge_redirects_norm_path( $source );
+	$key    = sitebridge_redirects_key( $source );
 	$before = count( $redirects );
 	$redirects = array_values( array_filter( $redirects, function ( $r ) use ( $key ) {
-		return sitebridge_redirects_norm_path( isset( $r['source'] ) ? $r['source'] : '' ) !== $key;
+		return sitebridge_redirects_key( isset( $r['source'] ) ? $r['source'] : '' ) !== $key;
 	} ) );
 	update_option( SITEBRIDGE_REDIRECTS_OPTION, $redirects );
 	return $before - count( $redirects );
@@ -415,14 +446,48 @@ add_action( 'template_redirect', function () {
 	if ( empty( $redirects ) ) {
 		return;
 	}
-	$req = sitebridge_redirects_norm_path( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '' );
+	$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '';
+	$req      = sitebridge_redirects_norm_path( $request_uri );
+	$raw_path = parse_url( $request_uri, PHP_URL_PATH );
+	if ( $raw_path === null || $raw_path === false || $raw_path === '' ) {
+		$raw_path = '/';
+	}
+
+	// Pass 1: exact-path rules (fast, trailing-slash/case tolerant).
 	foreach ( $redirects as $r ) {
 		if ( empty( $r['source'] ) || empty( $r['target'] ) ) {
 			continue;
 		}
+		if ( sitebridge_redirects_regex_pattern( $r['source'] ) !== null ) {
+			continue; // regex rules run in pass 2
+		}
 		if ( sitebridge_redirects_norm_path( $r['source'] ) === $req ) {
 			$type = in_array( (int) ( isset( $r['type'] ) ? $r['type'] : 301 ), array( 301, 302, 307, 308 ), true ) ? (int) $r['type'] : 301;
 			wp_redirect( (string) $r['target'], $type );
+			exit;
+		}
+	}
+
+	// Pass 2: regex rules ("regex:" prefixed sources), matched against the raw
+	// request path in stored order. $1–$9 / ${1}–${9} in the target are replaced
+	// with capture groups.
+	$delim = chr( 1 );
+	foreach ( $redirects as $r ) {
+		if ( empty( $r['source'] ) || empty( $r['target'] ) ) {
+			continue;
+		}
+		$pattern = sitebridge_redirects_regex_pattern( $r['source'] );
+		if ( $pattern === null ) {
+			continue;
+		}
+		$m = array();
+		if ( @preg_match( $delim . str_replace( $delim, '', $pattern ) . $delim, $raw_path, $m ) ) {
+			$target = (string) $r['target'];
+			for ( $i = min( count( $m ) - 1, 9 ); $i >= 1; $i-- ) {
+				$target = str_replace( array( '${' . $i . '}', '$' . $i ), $m[ $i ], $target );
+			}
+			$type = in_array( (int) ( isset( $r['type'] ) ? $r['type'] : 301 ), array( 301, 302, 307, 308 ), true ) ? (int) $r['type'] : 301;
+			wp_redirect( $target, $type );
 			exit;
 		}
 	}
@@ -473,6 +538,9 @@ function sitebridge_redirects_rest_add( WP_REST_Request $req ) {
 		return new WP_Error( 'bad_input', 'source and target are required', array( 'status' => 400 ) );
 	}
 	$res = sitebridge_redirects_save( $source, $target, $req['type'] !== null ? $req['type'] : 301 );
+	if ( ! empty( $res['error'] ) ) {
+		return new WP_Error( 'invalid_regex', 'The "regex:" source pattern does not compile', array( 'status' => 400 ) );
+	}
 	return array( 'saved' => true, 'updated' => $res['updated'], 'redirect' => $res['entry'], 'count' => $res['count'] );
 }
 
@@ -490,7 +558,7 @@ function sitebridge_redirects_import( $entries ) {
 	$existing = sitebridge_redirects_all();
 	$index = array();
 	foreach ( $existing as $i => $r ) {
-		$index[ sitebridge_redirects_norm_path( isset( $r['source'] ) ? $r['source'] : '' ) ] = $i;
+		$index[ sitebridge_redirects_key( isset( $r['source'] ) ? $r['source'] : '' ) ] = $i;
 	}
 	$added = 0; $updated = 0; $skipped = 0;
 	foreach ( $entries as $e ) {
@@ -504,8 +572,16 @@ function sitebridge_redirects_import( $entries ) {
 			$skipped++;
 			continue;
 		}
-		$key   = sitebridge_redirects_norm_path( $source );
+		$pattern = sitebridge_redirects_regex_pattern( $source );
+		if ( $pattern !== null && ! sitebridge_redirects_regex_valid( $pattern ) ) {
+			$skipped++;
+			continue;
+		}
+		$key   = sitebridge_redirects_key( $source );
 		$entry = array( 'source' => $source, 'target' => $target, 'type' => $type, 'created' => current_time( 'mysql' ) );
+		if ( $pattern !== null ) {
+			$entry['regex'] = true;
+		}
 		if ( isset( $index[ $key ] ) ) {
 			$existing[ $index[ $key ] ] = $entry;
 			$updated++;
@@ -629,7 +705,8 @@ function sitebridge_admin_redirects_page() {
 			<table class="form-table" role="presentation">
 				<tr>
 					<th scope="row"><label for="sb_source">From (path)</label></th>
-					<td><input name="source" id="sb_source" type="text" class="regular-text" placeholder="/old-page/" required /></td>
+					<td><input name="source" id="sb_source" type="text" class="regular-text" placeholder="/old-page/" required />
+					<p class="description">Exact path, or a regex rule: prefix with <code>regex:</code> (e.g. <code>regex:^/blog/[0-9]{4}/[0-9]{2}/[0-9]{2}/(.+)$</code>). Use <code>$1</code>&hellip;<code>$9</code> in the target for capture groups.</p></td>
 				</tr>
 				<tr>
 					<th scope="row"><label for="sb_target">To (URL or path)</label></th>
