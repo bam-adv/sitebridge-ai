@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.8.0
+ * Version:     1.9.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.8.0' );
+define( 'SITEBRIDGE_VERSION', '1.9.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -295,6 +295,30 @@ add_action( 'rest_api_init', function () {
 			'new_title' => array( 'required' => false, 'type' => 'string' ),
 		),
 	) );
+	register_rest_route( SITEBRIDGE_NS, '/nav/add-link', array(
+		'methods'             => 'POST',
+		'callback'            => 'sitebridge_nav_rest_add_link',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+		'args'                => array(
+			'title'         => array( 'required' => true,  'type' => 'string' ),
+			'url'           => array( 'required' => true,  'type' => 'string' ),
+			'target'        => array( 'required' => false, 'type' => 'string' ),
+			'link_style'    => array( 'required' => false, 'type' => 'string' ),
+			'parent_title'  => array( 'required' => false, 'type' => 'string' ),
+			'column_title'  => array( 'required' => false, 'type' => 'string' ),
+			'create_column' => array( 'required' => false, 'type' => 'boolean' ),
+			'position'      => array( 'required' => false, 'type' => 'integer' ),
+		),
+	) );
+	register_rest_route( SITEBRIDGE_NS, '/nav/remove-link', array(
+		'methods'             => 'POST',
+		'callback'            => 'sitebridge_nav_rest_remove_link',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+		'args'                => array(
+			'url'          => array( 'required' => true,  'type' => 'string' ),
+			'parent_title' => array( 'required' => false, 'type' => 'string' ),
+		),
+	) );
 } );
 
 function sitebridge_nav_rest_get() {
@@ -353,6 +377,193 @@ function sitebridge_nav_rest_replace_link( WP_REST_Request $req ) {
 		update_field( SITEBRIDGE_NAV_FIELD, $nav, $opt );
 	}
 	return array( 'replaced' => $count, 'old_url' => $old, 'new_url' => $new );
+}
+
+/** Trailing-slash tolerant URL comparison (same tolerance as replace-link). */
+function sitebridge_nav_url_eq( $a, $b ) {
+	return rtrim( (string) $a, '/' ) === rtrim( (string) $b, '/' );
+}
+
+/**
+ * Add a link to the desktop mega-menu (Culligan v4 theme shape:
+ * nav_items[] -> nav_item_link / nav_item_sub_items[] (columns) -> sub_item_links[]).
+ *
+ * - No parent_title           => append/insert a new TOP-LEVEL nav item.
+ * - parent_title + column     => insert into that column's sub_item_links.
+ * - parent_title, one column  => column_title optional (unambiguous).
+ * - create_column=true        => add the named column to the parent first.
+ */
+function sitebridge_nav_rest_add_link( WP_REST_Request $req ) {
+	if ( ! function_exists( 'get_field' ) ) {
+		return new WP_Error( 'acf_missing', 'ACF is not active', array( 'status' => 500 ) );
+	}
+	$opt = apply_filters( 'sitebridge_nav_option_id', SITEBRIDGE_NAV_OPTION_ID );
+	$nav = get_field( SITEBRIDGE_NAV_FIELD, $opt );
+	if ( ! is_array( $nav ) || empty( $nav['nav_items'] ) || ! is_array( $nav['nav_items'] ) ) {
+		return new WP_Error( 'no_nav', 'No data for field "' . SITEBRIDGE_NAV_FIELD . '" — check GET ' . SITEBRIDGE_NS . '/nav _available_fields', array( 'status' => 404 ) );
+	}
+
+	$title = trim( sanitize_text_field( (string) $req['title'] ) );
+	$url   = trim( (string) $req['url'] );
+	if ( $title === '' || $url === '' ) {
+		return new WP_Error( 'bad_input', 'title and url are required', array( 'status' => 400 ) );
+	}
+	$link = array(
+		'title'  => $title,
+		'url'    => ( $url === '#' ) ? '#' : esc_url_raw( $url ),
+		'target' => sanitize_text_field( (string) ( $req['target'] !== null ? $req['target'] : '' ) ),
+	);
+	$link_style   = ( $req['link_style'] !== null && $req['link_style'] !== '' ) ? sanitize_text_field( (string) $req['link_style'] ) : 'bold-caret';
+	$parent_title = ( $req['parent_title'] !== null ) ? trim( (string) $req['parent_title'] ) : '';
+
+	// ---- Case A: new top-level nav item -------------------------------------
+	if ( $parent_title === '' ) {
+		foreach ( $nav['nav_items'] as $item ) {
+			if ( isset( $item['nav_item_link']['title'] ) && strcasecmp( trim( (string) $item['nav_item_link']['title'] ), $title ) === 0 ) {
+				return new WP_Error( 'duplicate', 'A top-level nav item with that title already exists', array( 'status' => 409 ) );
+			}
+		}
+		$new_item = array(
+			'nav_item_link'           => $link,
+			'nav_item_link_css_class' => '',
+			'nav_item_sub_items'      => false,
+		);
+		$pos = ( $req['position'] !== null )
+			? max( 0, min( (int) $req['position'], count( $nav['nav_items'] ) ) )
+			: count( $nav['nav_items'] );
+		array_splice( $nav['nav_items'], $pos, 0, array( $new_item ) );
+		update_field( SITEBRIDGE_NAV_FIELD, $nav, $opt );
+		return array( 'added' => 'top_level', 'title' => $title, 'url' => $link['url'], 'position' => $pos );
+	}
+
+	// ---- Case B: link inside a parent item's mega-menu column ---------------
+	foreach ( $nav['nav_items'] as &$item ) {
+		if ( ! isset( $item['nav_item_link']['title'] ) || strcasecmp( trim( (string) $item['nav_item_link']['title'] ), $parent_title ) !== 0 ) {
+			continue;
+		}
+		if ( ! is_array( $item['nav_item_sub_items'] ) ) {
+			$item['nav_item_sub_items'] = array();
+		}
+
+		$column_title = ( $req['column_title'] !== null ) ? trim( (string) $req['column_title'] ) : null;
+		$col_index    = null;
+		if ( $column_title !== null ) {
+			foreach ( $item['nav_item_sub_items'] as $i => $col ) {
+				if ( isset( $col['sub_item_title'] ) && strcasecmp( trim( (string) $col['sub_item_title'] ), $column_title ) === 0 ) {
+					$col_index = $i;
+					break;
+				}
+			}
+		} elseif ( count( $item['nav_item_sub_items'] ) === 1 ) {
+			$col_index = 0; // only one column — unambiguous
+		}
+
+		if ( $col_index === null ) {
+			if ( empty( $req['create_column'] ) ) {
+				$names = array();
+				foreach ( $item['nav_item_sub_items'] as $col ) {
+					$names[] = isset( $col['sub_item_title'] ) ? (string) $col['sub_item_title'] : '';
+				}
+				return new WP_Error(
+					'column_not_found',
+					'Column not found or ambiguous. Pass column_title matching one of: [' . implode( ' | ', $names ) . '] — or create_column=true to add it.',
+					array( 'status' => 400 )
+				);
+			}
+			$item['nav_item_sub_items'][] = array(
+				'sub_item_title' => sanitize_text_field( (string) ( $column_title !== null ? $column_title : '' ) ),
+				'sub_item_links' => array(),
+			);
+			$col_index = count( $item['nav_item_sub_items'] ) - 1;
+		}
+
+		if ( ! isset( $item['nav_item_sub_items'][ $col_index ]['sub_item_links'] ) || ! is_array( $item['nav_item_sub_items'][ $col_index ]['sub_item_links'] ) ) {
+			$item['nav_item_sub_items'][ $col_index ]['sub_item_links'] = array();
+		}
+		$links = &$item['nav_item_sub_items'][ $col_index ]['sub_item_links'];
+
+		foreach ( $links as $existing ) {
+			if ( isset( $existing['link']['url'] ) && sitebridge_nav_url_eq( $existing['link']['url'], $link['url'] ) ) {
+				return new WP_Error( 'duplicate', 'That URL already exists in this column', array( 'status' => 409 ) );
+			}
+		}
+
+		$pos = ( $req['position'] !== null )
+			? max( 0, min( (int) $req['position'], count( $links ) ) )
+			: count( $links );
+		array_splice( $links, $pos, 0, array( array( 'link' => $link, 'link_style' => $link_style ) ) );
+		unset( $links );
+
+		update_field( SITEBRIDGE_NAV_FIELD, $nav, $opt );
+		return array(
+			'added'    => 'sub_link',
+			'parent'   => trim( (string) $item['nav_item_link']['title'] ),
+			'column'   => (string) $item['nav_item_sub_items'][ $col_index ]['sub_item_title'],
+			'title'    => $title,
+			'url'      => $link['url'],
+			'position' => $pos,
+		);
+	}
+	unset( $item );
+
+	return new WP_Error( 'parent_not_found', 'No top-level nav item matched parent_title "' . $parent_title . '"', array( 'status' => 404 ) );
+}
+
+/**
+ * Remove mega-menu links whose URL matches (trailing-slash tolerant), optionally
+ * scoped to one top-level item via parent_title. Only removes links inside
+ * columns (sub_item_links) — never removes top-level nav items. Columns left
+ * empty are pruned; a parent left with zero columns gets sub_items=false.
+ */
+function sitebridge_nav_rest_remove_link( WP_REST_Request $req ) {
+	if ( ! function_exists( 'get_field' ) ) {
+		return new WP_Error( 'acf_missing', 'ACF is not active', array( 'status' => 500 ) );
+	}
+	$opt = apply_filters( 'sitebridge_nav_option_id', SITEBRIDGE_NAV_OPTION_ID );
+	$nav = get_field( SITEBRIDGE_NAV_FIELD, $opt );
+	if ( ! is_array( $nav ) || empty( $nav['nav_items'] ) || ! is_array( $nav['nav_items'] ) ) {
+		return new WP_Error( 'no_nav', 'No data for field "' . SITEBRIDGE_NAV_FIELD . '" — check GET ' . SITEBRIDGE_NS . '/nav _available_fields', array( 'status' => 404 ) );
+	}
+
+	$url = trim( (string) $req['url'] );
+	if ( $url === '' ) {
+		return new WP_Error( 'bad_input', 'url is required', array( 'status' => 400 ) );
+	}
+	$parent_title = ( $req['parent_title'] !== null ) ? trim( (string) $req['parent_title'] ) : '';
+
+	$removed = 0;
+	foreach ( $nav['nav_items'] as &$item ) {
+		if ( $parent_title !== '' && ( ! isset( $item['nav_item_link']['title'] ) || strcasecmp( trim( (string) $item['nav_item_link']['title'] ), $parent_title ) !== 0 ) ) {
+			continue;
+		}
+		if ( ! is_array( $item['nav_item_sub_items'] ) ) {
+			continue;
+		}
+		foreach ( $item['nav_item_sub_items'] as $ci => &$col ) {
+			if ( empty( $col['sub_item_links'] ) || ! is_array( $col['sub_item_links'] ) ) {
+				continue;
+			}
+			$before = count( $col['sub_item_links'] );
+			$col['sub_item_links'] = array_values( array_filter( $col['sub_item_links'], function ( $l ) use ( $url ) {
+				return ! ( isset( $l['link']['url'] ) && sitebridge_nav_url_eq( $l['link']['url'], $url ) );
+			} ) );
+			$removed += $before - count( $col['sub_item_links'] );
+		}
+		unset( $col );
+		// Prune columns emptied by the removal; false when no columns remain.
+		$item['nav_item_sub_items'] = array_values( array_filter( $item['nav_item_sub_items'], function ( $c ) {
+			return ! empty( $c['sub_item_links'] );
+		} ) );
+		if ( empty( $item['nav_item_sub_items'] ) ) {
+			$item['nav_item_sub_items'] = false;
+		}
+	}
+	unset( $item );
+
+	if ( $removed > 0 ) {
+		update_field( SITEBRIDGE_NAV_FIELD, $nav, $opt );
+	}
+	return array( 'removed' => $removed, 'url' => $url );
 }
 
 /* ============================================================================
