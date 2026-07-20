@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.9.0
+ * Version:     1.10.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.9.0' );
+define( 'SITEBRIDGE_VERSION', '1.10.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -306,6 +306,7 @@ add_action( 'rest_api_init', function () {
 			'link_style'    => array( 'required' => false, 'type' => 'string' ),
 			'parent_title'  => array( 'required' => false, 'type' => 'string' ),
 			'column_title'  => array( 'required' => false, 'type' => 'string' ),
+			'column_index'  => array( 'required' => false, 'type' => 'integer' ),
 			'create_column' => array( 'required' => false, 'type' => 'boolean' ),
 			'position'      => array( 'required' => false, 'type' => 'integer' ),
 		),
@@ -317,6 +318,8 @@ add_action( 'rest_api_init', function () {
 		'args'                => array(
 			'url'          => array( 'required' => true,  'type' => 'string' ),
 			'parent_title' => array( 'required' => false, 'type' => 'string' ),
+			'column_title' => array( 'required' => false, 'type' => 'string' ),
+			'column_index' => array( 'required' => false, 'type' => 'integer' ),
 		),
 	) );
 } );
@@ -384,6 +387,18 @@ function sitebridge_nav_url_eq( $a, $b ) {
 	return rtrim( (string) $a, '/' ) === rtrim( (string) $b, '/' );
 }
 
+/** Human-readable `index="title"` column listing for disambiguation errors. */
+function sitebridge_nav_columns_listing( $sub_items ) {
+	$listing = array();
+	if ( is_array( $sub_items ) ) {
+		foreach ( $sub_items as $i => $col ) {
+			$title = isset( $col['sub_item_title'] ) ? (string) $col['sub_item_title'] : '';
+			$listing[] = $i . '="' . $title . '"';
+		}
+	}
+	return implode( ' | ', $listing );
+}
+
 /**
  * Add a link to the desktop mega-menu (Culligan v4 theme shape:
  * nav_items[] -> nav_item_link / nav_item_sub_items[] (columns) -> sub_item_links[]).
@@ -391,6 +406,8 @@ function sitebridge_nav_url_eq( $a, $b ) {
  * - No parent_title           => append/insert a new TOP-LEVEL nav item.
  * - parent_title + column     => insert into that column's sub_item_links.
  * - parent_title, one column  => column_title optional (unambiguous).
+ * - column_index (0-based)    => targets a column directly; wins over column_title.
+ * - column_title (ambiguous)  => 409 listing the columns instead of taking the first.
  * - create_column=true        => add the named column to the parent first.
  */
 function sitebridge_nav_rest_add_link( WP_REST_Request $req ) {
@@ -446,13 +463,42 @@ function sitebridge_nav_rest_add_link( WP_REST_Request $req ) {
 		}
 
 		$column_title = ( $req['column_title'] !== null ) ? trim( (string) $req['column_title'] ) : null;
+		$column_index = ( $req['column_index'] !== null ) ? (int) $req['column_index'] : null;
 		$col_index    = null;
-		if ( $column_title !== null ) {
+		if ( $column_index !== null ) {
+			// Direct 0-based targeting — wins over column_title; errors if out of range.
+			$col_count = count( $item['nav_item_sub_items'] );
+			if ( $column_index < 0 || $column_index >= $col_count ) {
+				return new WP_Error(
+					'column_index_out_of_range',
+					sprintf(
+						'column_index %d is out of range for "%s" — it has %d column(s)%s. Columns: [%s]',
+						$column_index,
+						trim( (string) $item['nav_item_link']['title'] ),
+						$col_count,
+						$col_count > 0 ? ' (valid 0–' . ( $col_count - 1 ) . ')' : '',
+						sitebridge_nav_columns_listing( $item['nav_item_sub_items'] )
+					),
+					array( 'status' => 400 )
+				);
+			}
+			$col_index = $column_index;
+		} elseif ( $column_title !== null ) {
+			$matches = array();
 			foreach ( $item['nav_item_sub_items'] as $i => $col ) {
 				if ( isset( $col['sub_item_title'] ) && strcasecmp( trim( (string) $col['sub_item_title'] ), $column_title ) === 0 ) {
-					$col_index = $i;
-					break;
+					$matches[] = $i;
 				}
+			}
+			if ( count( $matches ) > 1 ) {
+				return new WP_Error(
+					'column_ambiguous',
+					'column_title "' . $column_title . '" matches ' . count( $matches ) . ' columns — pass column_index to target one directly. Columns: [' . sitebridge_nav_columns_listing( $item['nav_item_sub_items'] ) . ']',
+					array( 'status' => 409 )
+				);
+			}
+			if ( count( $matches ) === 1 ) {
+				$col_index = $matches[0];
 			}
 		} elseif ( count( $item['nav_item_sub_items'] ) === 1 ) {
 			$col_index = 0; // only one column — unambiguous
@@ -511,9 +557,11 @@ function sitebridge_nav_rest_add_link( WP_REST_Request $req ) {
 
 /**
  * Remove mega-menu links whose URL matches (trailing-slash tolerant), optionally
- * scoped to one top-level item via parent_title. Only removes links inside
- * columns (sub_item_links) — never removes top-level nav items. Columns left
- * empty are pruned; a parent left with zero columns gets sub_items=false.
+ * scoped to one top-level item via parent_title and/or to a single column via
+ * column_index (0-based, wins over column_title) or column_title (409 on an
+ * ambiguous match). With no column scoping, every column is searched. Only removes
+ * links inside columns (sub_item_links) — never removes top-level nav items.
+ * Columns left empty are pruned; a parent left with zero columns gets sub_items=false.
  */
 function sitebridge_nav_rest_remove_link( WP_REST_Request $req ) {
 	if ( ! function_exists( 'get_field' ) ) {
@@ -530,6 +578,8 @@ function sitebridge_nav_rest_remove_link( WP_REST_Request $req ) {
 		return new WP_Error( 'bad_input', 'url is required', array( 'status' => 400 ) );
 	}
 	$parent_title = ( $req['parent_title'] !== null ) ? trim( (string) $req['parent_title'] ) : '';
+	$column_title = ( $req['column_title'] !== null ) ? trim( (string) $req['column_title'] ) : null;
+	$column_index = ( $req['column_index'] !== null ) ? (int) $req['column_index'] : null;
 
 	$removed = 0;
 	foreach ( $nav['nav_items'] as &$item ) {
@@ -539,7 +589,50 @@ function sitebridge_nav_rest_remove_link( WP_REST_Request $req ) {
 		if ( ! is_array( $item['nav_item_sub_items'] ) ) {
 			continue;
 		}
+
+		// Optionally scope the removal to one column. column_index (0-based) targets a
+		// column directly and wins over column_title; column_title errors on an ambiguous
+		// (multi-column) match rather than silently taking the first. Neither set => all
+		// columns, preserving the original behaviour.
+		$only_cols = null;
+		if ( $column_index !== null ) {
+			$col_count = count( $item['nav_item_sub_items'] );
+			if ( $column_index < 0 || $column_index >= $col_count ) {
+				return new WP_Error(
+					'column_index_out_of_range',
+					sprintf(
+						'column_index %d is out of range for "%s" — it has %d column(s)%s. Columns: [%s]',
+						$column_index,
+						isset( $item['nav_item_link']['title'] ) ? trim( (string) $item['nav_item_link']['title'] ) : '',
+						$col_count,
+						$col_count > 0 ? ' (valid 0–' . ( $col_count - 1 ) . ')' : '',
+						sitebridge_nav_columns_listing( $item['nav_item_sub_items'] )
+					),
+					array( 'status' => 400 )
+				);
+			}
+			$only_cols = array( $column_index );
+		} elseif ( $column_title !== null ) {
+			$matches = array();
+			foreach ( $item['nav_item_sub_items'] as $i => $col ) {
+				if ( isset( $col['sub_item_title'] ) && strcasecmp( trim( (string) $col['sub_item_title'] ), $column_title ) === 0 ) {
+					$matches[] = $i;
+				}
+			}
+			if ( count( $matches ) > 1 ) {
+				return new WP_Error(
+					'column_ambiguous',
+					'column_title "' . $column_title . '" matches ' . count( $matches ) . ' columns — pass column_index to target one. Columns: [' . sitebridge_nav_columns_listing( $item['nav_item_sub_items'] ) . ']',
+					array( 'status' => 409 )
+				);
+			}
+			$only_cols = $matches; // 0 matches => remove nothing; 1 => that column
+		}
+
 		foreach ( $item['nav_item_sub_items'] as $ci => &$col ) {
+			if ( $only_cols !== null && ! in_array( $ci, $only_cols, true ) ) {
+				continue;
+			}
 			if ( empty( $col['sub_item_links'] ) || ! is_array( $col['sub_item_links'] ) ) {
 				continue;
 			}
