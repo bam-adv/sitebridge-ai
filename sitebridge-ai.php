@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.11.0
+ * Version:     1.12.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.11.0' );
+define( 'SITEBRIDGE_VERSION', '1.12.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -396,9 +396,12 @@ add_action( 'rest_api_init', function () {
 		'callback'            => 'sitebridge_nav_rest_replace_link',
 		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
 		'args'                => array(
-			'old_url'   => array( 'required' => true,  'type' => 'string' ),
-			'new_url'   => array( 'required' => true,  'type' => 'string' ),
-			'new_title' => array( 'required' => false, 'type' => 'string' ),
+			'old_url'      => array( 'required' => true,  'type' => 'string' ),
+			'new_url'      => array( 'required' => true,  'type' => 'string' ),
+			'new_title'    => array( 'required' => false, 'type' => 'string' ),
+			'parent_title' => array( 'required' => false, 'type' => 'string' ),
+			'column_title' => array( 'required' => false, 'type' => 'string' ),
+			'column_index' => array( 'required' => false, 'type' => 'integer' ),
 		),
 	) );
 	register_rest_route( SITEBRIDGE_NS, '/nav/add-link', array(
@@ -443,6 +446,16 @@ function sitebridge_nav_rest_get() {
 	);
 }
 
+/**
+ * Replace mega-menu link URLs (trailing-slash tolerant), optionally scoped.
+ *
+ * - No scoping (default)     => replace every matching URL anywhere in the nav
+ *   tree, including top-level items — the original behaviour, unchanged.
+ * - parent_title / column_*  => restrict to one top-level item and/or a single
+ *   column's sub_item_links, with the same disambiguation as remove-link:
+ *   column_index (0-based) wins over column_title; out-of-range => 400; an
+ *   ambiguous column_title => 409.
+ */
 function sitebridge_nav_rest_replace_link( WP_REST_Request $req ) {
 	if ( ! function_exists( 'get_field' ) ) {
 		return new WP_Error( 'acf_missing', 'ACF is not active', array( 'status' => 500 ) );
@@ -454,38 +467,122 @@ function sitebridge_nav_rest_replace_link( WP_REST_Request $req ) {
 	if ( $old === '' || $new === '' ) {
 		return new WP_Error( 'bad_input', 'old_url and new_url are required', array( 'status' => 400 ) );
 	}
+	$parent_title = ( $req['parent_title'] !== null ) ? trim( (string) $req['parent_title'] ) : '';
+	$column_title = ( $req['column_title'] !== null ) ? trim( (string) $req['column_title'] ) : null;
+	$column_index = ( $req['column_index'] !== null ) ? (int) $req['column_index'] : null;
+	$scoped       = ( $parent_title !== '' || $column_title !== null || $column_index !== null );
+
 	$nav = get_field( SITEBRIDGE_NAV_FIELD, $opt );
 	if ( ! is_array( $nav ) ) {
 		return new WP_Error( 'no_nav', 'No data for field "' . SITEBRIDGE_NAV_FIELD . '" — check GET ' . SITEBRIDGE_NS . '/nav _available_fields', array( 'status' => 404 ) );
 	}
+
 	$count = 0;
-	$norm  = function ( $u ) { return rtrim( (string) $u, '/' ); };
-	$walk  = function ( &$node ) use ( &$walk, $old, $new, $new_title, &$count, $norm ) {
-		if ( ! is_array( $node ) ) {
-			return;
-		}
-		if ( isset( $node['url'] ) && is_string( $node['url'] ) ) {
-			if ( $norm( $node['url'] ) === $norm( $old ) ) {
-				$node['url'] = $new;
-				if ( $new_title !== null && $new_title !== '' ) {
-					$node['title'] = $new_title;
+
+	// Unscoped: preserve the original tree-wide replace (top-level items included).
+	if ( ! $scoped ) {
+		$walk = function ( &$node ) use ( &$walk, $old, $new, $new_title, &$count ) {
+			if ( ! is_array( $node ) ) {
+				return;
+			}
+			if ( isset( $node['url'] ) && is_string( $node['url'] ) ) {
+				if ( sitebridge_nav_url_eq( $node['url'], $old ) ) {
+					$node['url'] = $new;
+					if ( $new_title !== null && $new_title !== '' ) {
+						$node['title'] = $new_title;
+					}
+					$count++;
 				}
-				$count++;
+				return;
 			}
-			return;
-		}
-		foreach ( $node as &$child ) {
-			if ( is_array( $child ) ) {
-				$walk( $child );
+			foreach ( $node as &$child ) {
+				if ( is_array( $child ) ) {
+					$walk( $child );
+				}
 			}
+			unset( $child );
+		};
+		$walk( $nav );
+		if ( $count > 0 ) {
+			update_field( SITEBRIDGE_NAV_FIELD, $nav, $opt );
 		}
-		unset( $child );
-	};
-	$walk( $nav );
+		return array( 'replaced' => $count, 'old_url' => $old, 'new_url' => $new, 'scoped' => false );
+	}
+
+	// Scoped: only touch sub_item_links inside the matched parent/column(s).
+	if ( empty( $nav['nav_items'] ) || ! is_array( $nav['nav_items'] ) ) {
+		return new WP_Error( 'no_nav', 'No data for field "' . SITEBRIDGE_NAV_FIELD . '" — check GET ' . SITEBRIDGE_NS . '/nav _available_fields', array( 'status' => 404 ) );
+	}
+	foreach ( $nav['nav_items'] as &$item ) {
+		if ( $parent_title !== '' && ( ! isset( $item['nav_item_link']['title'] ) || strcasecmp( trim( (string) $item['nav_item_link']['title'] ), $parent_title ) !== 0 ) ) {
+			continue;
+		}
+		if ( ! is_array( $item['nav_item_sub_items'] ) ) {
+			continue;
+		}
+
+		// Resolve which column(s) to touch — same rules as remove-link.
+		$only_cols = null;
+		if ( $column_index !== null ) {
+			$col_count = count( $item['nav_item_sub_items'] );
+			if ( $column_index < 0 || $column_index >= $col_count ) {
+				return new WP_Error(
+					'column_index_out_of_range',
+					sprintf(
+						'column_index %d is out of range for "%s" — it has %d column(s)%s. Columns: [%s]',
+						$column_index,
+						isset( $item['nav_item_link']['title'] ) ? trim( (string) $item['nav_item_link']['title'] ) : '',
+						$col_count,
+						$col_count > 0 ? ' (valid 0–' . ( $col_count - 1 ) . ')' : '',
+						sitebridge_nav_columns_listing( $item['nav_item_sub_items'] )
+					),
+					array( 'status' => 400 )
+				);
+			}
+			$only_cols = array( $column_index );
+		} elseif ( $column_title !== null ) {
+			$matches = array();
+			foreach ( $item['nav_item_sub_items'] as $i => $col ) {
+				if ( isset( $col['sub_item_title'] ) && strcasecmp( trim( (string) $col['sub_item_title'] ), $column_title ) === 0 ) {
+					$matches[] = $i;
+				}
+			}
+			if ( count( $matches ) > 1 ) {
+				return new WP_Error(
+					'column_ambiguous',
+					'column_title "' . $column_title . '" matches ' . count( $matches ) . ' columns — pass column_index to target one. Columns: [' . sitebridge_nav_columns_listing( $item['nav_item_sub_items'] ) . ']',
+					array( 'status' => 409 )
+				);
+			}
+			$only_cols = $matches; // 0 matches => nothing; 1 => that column
+		}
+
+		foreach ( $item['nav_item_sub_items'] as $ci => &$col ) {
+			if ( $only_cols !== null && ! in_array( $ci, $only_cols, true ) ) {
+				continue;
+			}
+			if ( empty( $col['sub_item_links'] ) || ! is_array( $col['sub_item_links'] ) ) {
+				continue;
+			}
+			foreach ( $col['sub_item_links'] as &$l ) {
+				if ( isset( $l['link']['url'] ) && sitebridge_nav_url_eq( $l['link']['url'], $old ) ) {
+					$l['link']['url'] = $new;
+					if ( $new_title !== null && $new_title !== '' ) {
+						$l['link']['title'] = $new_title;
+					}
+					$count++;
+				}
+			}
+			unset( $l );
+		}
+		unset( $col );
+	}
+	unset( $item );
+
 	if ( $count > 0 ) {
 		update_field( SITEBRIDGE_NAV_FIELD, $nav, $opt );
 	}
-	return array( 'replaced' => $count, 'old_url' => $old, 'new_url' => $new );
+	return array( 'replaced' => $count, 'old_url' => $old, 'new_url' => $new, 'scoped' => true );
 }
 
 /** Trailing-slash tolerant URL comparison (same tolerance as replace-link). */
