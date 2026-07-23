@@ -43,10 +43,29 @@ through the code.
 ## Self-updater
 
 `pre_set_site_transient_update_plugins` → polls `api.github.com/repos/{SITEBRIDGE_GH_REPO}/releases/latest`,
-installs the release's `.zip` asset (falls back to the source zipball), renames the unpacked
-`repo-tag/` dir to the plugin slug. `SITEBRIDGE_GH_REPO = 'bam-adv/sitebridge-ai'`.
-**To ship an update:** bump `Version:` + `SITEBRIDGE_VERSION`, tag, publish a GitHub release (ideally
-with a built `.zip` asset). Cleanup: line ~34 still has a leftover `// <-- REPLACE with your repo`.
+offers the release's `.zip` asset, renames the unpacked `repo-tag/` dir to the plugin slug.
+`SITEBRIDGE_GH_REPO = 'bam-adv/sitebridge-ai'`. Runs for manual AND background auto-updates.
+
+### Signed releases (required since v1.11.0)
+
+Every release `.zip` is verified against the embedded Ed25519 public key (`SITEBRIDGE_UPDATE_PUBKEY`)
+in an `upgrader_pre_download` hook **before install** (`sodium_crypto_sign_verify_detached`). A
+missing / invalid / unverifiable signature is **refused** (fail-closed) with an admin notice +
+`error_log`; the source-zipball fallback carries no `.sig`, so it's refused too. The **private key is
+held offline** by the maintainer (password manager) — never in this repo or CI. (A checksum published
+in the same release would not help: whoever can publish the zip can publish its checksum; only a
+signature they can't forge defends a compromised release channel.)
+
+**To cut a release (v1.11.0 onward):**
+1. Bump `Version:` (header) + `SITEBRIDGE_VERSION`.
+2. Build the plugin `.zip` (must unpack to a `sitebridge-ai/` directory).
+3. Sign it: `SB_SIGN_KEY='<base64 secret from your password manager>' scripts/sign-release.sh sitebridge-ai.zip` → writes `sitebridge-ai.zip.sig`.
+4. Publish the GitHub release with **both** `sitebridge-ai.zip` and `sitebridge-ai.zip.sig` attached.
+
+Every release from v1.11.0 on **must** be signed or sites refuse it. Existing v1.10.0 installs upgrade
+to v1.11.0 without verification (old updater) — that's the graceful cutover; they verify everything
+after. **Key rotation:** ship a manual plugin update carrying a new `SITEBRIDGE_UPDATE_PUBKEY`, then
+sign all later releases with the matching new private key.
 
 ## Deployment / fleet — intentionally NOT listed here
 
