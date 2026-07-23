@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.10.0
+ * Version:     1.11.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,12 +27,20 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.10.0' );
+define( 'SITEBRIDGE_VERSION', '1.11.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
-	define( 'SITEBRIDGE_GH_REPO', 'bam-adv/sitebridge-ai' ); // <-- REPLACE with your repo
+	define( 'SITEBRIDGE_GH_REPO', 'bam-adv/sitebridge-ai' );
 }
+
+// --- Release signature verification (Ed25519 / libsodium) --------------------
+// PUBLIC key only. Each release .zip is signed with the matching PRIVATE key,
+// which is held offline by the maintainer and never lives in this repo. The
+// updater refuses to install any release whose .zip does not verify against
+// this key (fail-closed). Key rotation = ship a manual plugin update carrying
+// the new public key here, then sign all later releases with the new key.
+const SITEBRIDGE_UPDATE_PUBKEY = '2TopyeMZDoA7MD/rA07m8L3Tjp40/ktFPRPi7asEzUk=';
 
 // --- Schema storage (kept as legacy keys for data compatibility) -------------
 const SITEBRIDGE_SCHEMA_META_KEY        = '_bam_schema_jsonld';
@@ -67,11 +75,11 @@ function sitebridge_check_for_update( $transient ) {
 	}
 	$latest = ltrim( $release->tag_name, 'vV' );
 	if ( version_compare( $latest, SITEBRIDGE_VERSION, '>' ) ) {
-		// Prefer an attached release asset (.zip); fall back to the source zipball.
-		$package = '';
-		if ( ! empty( $release->assets ) && ! empty( $release->assets[0]->browser_download_url ) ) {
-			$package = $release->assets[0]->browser_download_url;
-		} elseif ( ! empty( $release->zipball_url ) ) {
+		// Use the signed release .zip asset — verified before install (see
+		// sitebridge_verify_before_download). Fall back to the zipball only so an
+		// update is still offered; it has no .sig and will be refused.
+		$package = sitebridge_release_asset( $release, '.zip' );
+		if ( $package === '' && ! empty( $release->zipball_url ) ) {
 			$package = $release->zipball_url;
 		}
 		$file = plugin_basename( __FILE__ );
@@ -132,6 +140,104 @@ add_filter( 'auto_update_plugin', function ( $update, $item ) {
 	}
 	return $update;
 }, 10, 2 );
+
+/* ----------------------------------------------------------------------------
+ * Release signature verification — refuse to install any release whose .zip
+ * does not verify against SITEBRIDGE_UPDATE_PUBKEY. Runs for BOTH manual and
+ * background auto-updates (upgrader_pre_download fires for both). Fail-closed:
+ * a missing/bad/unverifiable signature aborts the install and logs a notice.
+ * -------------------------------------------------------------------------- */
+
+// Find a release asset URL whose name ends with $suffix (e.g. '.zip', '.sig').
+function sitebridge_release_asset( $release, $suffix ) {
+	if ( empty( $release->assets ) || ! is_array( $release->assets ) ) {
+		return '';
+	}
+	$suffix = strtolower( $suffix );
+	foreach ( $release->assets as $asset ) {
+		if ( ! empty( $asset->name ) && ! empty( $asset->browser_download_url )
+			&& substr( strtolower( $asset->name ), -strlen( $suffix ) ) === $suffix ) {
+			return $asset->browser_download_url;
+		}
+	}
+	return '';
+}
+
+add_filter( 'upgrader_pre_download', 'sitebridge_verify_before_download', 10, 4 );
+function sitebridge_verify_before_download( $reply, $package, $upgrader, $hook_extra = array() ) {
+	// Only gate OUR plugin's update; leave everything else to WordPress.
+	if ( empty( $hook_extra['plugin'] ) || $hook_extra['plugin'] !== plugin_basename( __FILE__ ) ) {
+		return $reply;
+	}
+
+	$refuse = function ( $why ) {
+		error_log( 'SiteBridge AI: update refused — ' . $why );
+		set_transient( 'sitebridge_update_sig_error', $why, DAY_IN_SECONDS );
+		return new WP_Error( 'sitebridge_bad_signature', 'SiteBridge AI update refused: ' . $why );
+	};
+
+	if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
+		return $refuse( 'PHP libsodium is unavailable, so the release signature cannot be verified.' );
+	}
+	$pubkey = base64_decode( SITEBRIDGE_UPDATE_PUBKEY, true );
+	if ( $pubkey === false || strlen( $pubkey ) !== SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES ) {
+		return $refuse( 'the embedded public key is invalid.' );
+	}
+
+	$release = sitebridge_get_latest_release();
+	$sig_url = $release ? sitebridge_release_asset( $release, '.zip.sig' ) : '';
+	if ( $sig_url === '' && $release ) {
+		$sig_url = sitebridge_release_asset( $release, '.sig' );
+	}
+	if ( $sig_url === '' ) {
+		return $refuse( 'no ".sig" signature asset was found on the release.' );
+	}
+
+	if ( ! function_exists( 'download_url' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+	}
+	$zip = download_url( $package );
+	if ( is_wp_error( $zip ) ) {
+		return $refuse( 'could not download the release package: ' . $zip->get_error_message() );
+	}
+
+	$resp = wp_remote_get( $sig_url, array(
+		'timeout' => 15,
+		'headers' => array( 'User-Agent' => 'SiteBridge-AI' ),
+	) );
+	if ( is_wp_error( $resp ) || wp_remote_retrieve_response_code( $resp ) !== 200 ) {
+		@unlink( $zip );
+		return $refuse( 'could not download the signature asset.' );
+	}
+	$sig = base64_decode( trim( wp_remote_retrieve_body( $resp ) ), true );
+	if ( $sig === false || strlen( $sig ) !== SODIUM_CRYPTO_SIGN_BYTES ) {
+		@unlink( $zip );
+		return $refuse( 'the signature asset is malformed.' );
+	}
+
+	$bytes = file_get_contents( $zip );
+	if ( $bytes === false || ! sodium_crypto_sign_verify_detached( $sig, $bytes, $pubkey ) ) {
+		@unlink( $zip );
+		return $refuse( 'the release .zip did NOT verify against the embedded public key (tampered or unsigned).' );
+	}
+
+	// Verified — hand WordPress the local file; it skips its own download.
+	delete_transient( 'sitebridge_update_sig_error' );
+	return $zip;
+}
+
+// Surface a refused update to admins (the background updater is otherwise silent).
+add_action( 'admin_notices', function () {
+	if ( ! current_user_can( 'update_plugins' ) ) {
+		return;
+	}
+	$why = get_transient( 'sitebridge_update_sig_error' );
+	if ( $why ) {
+		echo '<div class="notice notice-error"><p><strong>SiteBridge AI:</strong> an automatic update was refused — '
+			. esc_html( $why )
+			. ' The plugin was <strong>not</strong> updated. Confirm the release .zip is signed, then retry.</p></div>';
+	}
+} );
 
 /* ============================================================================
  * SCHEMA MODULE  (JSON-LD per-post meta + per-post-type templates)
