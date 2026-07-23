@@ -40,7 +40,7 @@ if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
 // updater refuses to install any release whose .zip does not verify against
 // this key (fail-closed). Key rotation = ship a manual plugin update carrying
 // the new public key here, then sign all later releases with the new key.
-const SITEBRIDGE_UPDATE_PUBKEY = '2TopyeMZDoA7MD/rA07m8L3Tjp40/ktFPRPi7asEzUk=';
+const SITEBRIDGE_UPDATE_PUBKEY = 'YN/8ey9X7JLyGQEp6binEwL3tQrJTLTYp+dxjjsuZOE=';
 
 // --- Schema storage (kept as legacy keys for data compatibility) -------------
 const SITEBRIDGE_SCHEMA_META_KEY        = '_bam_schema_jsonld';
