@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.12.0
+ * Version:     1.13.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.12.0' );
+define( 'SITEBRIDGE_VERSION', '1.13.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -437,13 +437,56 @@ function sitebridge_nav_rest_get() {
 	if ( ! function_exists( 'get_field' ) ) {
 		return new WP_Error( 'acf_missing', 'ACF is not active', array( 'status' => 500 ) );
 	}
-	$opt = apply_filters( 'sitebridge_nav_option_id', SITEBRIDGE_NAV_OPTION_ID );
+	$opt      = apply_filters( 'sitebridge_nav_option_id', SITEBRIDGE_NAV_OPTION_ID );
+	$nav_data = get_field( SITEBRIDGE_NAV_FIELD, $opt );
 	return array(
 		'version'           => get_field( SITEBRIDGE_NAV_VERSION_FIELD, $opt ),
 		'nav_field'         => SITEBRIDGE_NAV_FIELD,
-		'nav'               => get_field( SITEBRIDGE_NAV_FIELD, $opt ),
+		'nav'               => $nav_data,
+		'_untrimmed_urls'   => sitebridge_nav_untrimmed_urls( $nav_data ),
 		'_available_fields' => array_keys( (array) ( get_fields( $opt ) ?: array() ) ),
 	);
+}
+
+/**
+ * Feature 3 bonus: flag nav link URLs whose stored value carries surrounding
+ * whitespace (stored !== trimmed). url_eq() now trims so these still match, but
+ * surfacing them makes one-time cleanups auditable (e.g. " https://culligancares.org/").
+ */
+function sitebridge_nav_untrimmed_urls( $nav ) {
+	$flagged = array();
+	if ( ! is_array( $nav ) || empty( $nav['nav_items'] ) || ! is_array( $nav['nav_items'] ) ) {
+		return $flagged;
+	}
+	$check = function ( $url, $where ) use ( &$flagged ) {
+		$url = (string) $url;
+		if ( $url !== '' && $url !== trim( $url ) ) {
+			$flagged[] = array( 'where' => $where, 'stored' => $url, 'trimmed' => trim( $url ) );
+		}
+	};
+	foreach ( $nav['nav_items'] as $ni => $item ) {
+		$label = isset( $item['nav_item_link']['title'] ) ? (string) $item['nav_item_link']['title'] : ( '#' . $ni );
+		if ( isset( $item['nav_item_link']['url'] ) ) {
+			$check( $item['nav_item_link']['url'], $label );
+		}
+		if ( empty( $item['nav_item_sub_items'] ) || ! is_array( $item['nav_item_sub_items'] ) ) {
+			continue;
+		}
+		foreach ( $item['nav_item_sub_items'] as $col ) {
+			$coltitle = isset( $col['sub_item_title'] ) ? (string) $col['sub_item_title'] : '';
+			if ( empty( $col['sub_item_links'] ) || ! is_array( $col['sub_item_links'] ) ) {
+				continue;
+			}
+			foreach ( $col['sub_item_links'] as $l ) {
+				if ( ! isset( $l['link']['url'] ) ) {
+					continue;
+				}
+				$ltitle = isset( $l['link']['title'] ) ? (string) $l['link']['title'] : '';
+				$check( $l['link']['url'], trim( $label . ' › ' . $coltitle . ' › ' . $ltitle, ' ›' ) );
+			}
+		}
+	}
+	return $flagged;
 }
 
 /**
@@ -585,9 +628,14 @@ function sitebridge_nav_rest_replace_link( WP_REST_Request $req ) {
 	return array( 'replaced' => $count, 'old_url' => $old, 'new_url' => $new, 'scoped' => true );
 }
 
-/** Trailing-slash tolerant URL comparison (same tolerance as replace-link). */
+/**
+ * Trailing-slash tolerant URL comparison (used by replace-link and remove-link).
+ * Also trims surrounding whitespace first: some stored ACF nav URLs carry a stray
+ * leading space (e.g. " https://culligancares.org/"), which otherwise makes every
+ * URL variant fail to match. trim() both sides, then ignore trailing slashes.
+ */
 function sitebridge_nav_url_eq( $a, $b ) {
-	return rtrim( (string) $a, '/' ) === rtrim( (string) $b, '/' );
+	return rtrim( trim( (string) $a ), '/' ) === rtrim( trim( (string) $b ), '/' );
 }
 
 /** Human-readable `index="title"` column listing for disambiguation errors. */
@@ -1140,6 +1188,298 @@ function sitebridge_redirects_rest_import( WP_REST_Request $req ) {
 	}
 	$res = sitebridge_redirects_import( $entries );
 	return array_merge( array( 'imported' => true ), $res );
+}
+
+/* ============================================================================
+ * CONTENT: byte-exact search/replace + Yoast canonical/robots meta
+ * ----------------------------------------------------------------------------
+ * Two write paths the connector can't safely do through core REST:
+ *   POST /bam/v1/search-replace  — surgical str_replace() on raw post_content.
+ *   POST /bam/v1/yoast-meta      — canonical / robots-noindex via *_post_meta.
+ * Both are gated behind manage_options, same as the redirect endpoints.
+ * ========================================================================== */
+
+add_action( 'rest_api_init', function () {
+	$perm = function () { return current_user_can( 'manage_options' ); };
+
+	register_rest_route( SITEBRIDGE_NS, '/search-replace', array(
+		'methods'             => 'POST',
+		'callback'            => 'sitebridge_search_replace_rest',
+		'permission_callback' => $perm,
+		'args'                => array(
+			'post_id'      => array( 'required' => true,  'type' => 'integer' ),
+			'replacements' => array( 'required' => true ),
+			'dry_run'      => array( 'required' => false, 'type' => 'boolean' ),
+		),
+	) );
+
+	register_rest_route( SITEBRIDGE_NS, '/yoast-meta', array(
+		'methods'             => 'POST',
+		'callback'            => 'sitebridge_yoast_meta_rest',
+		'permission_callback' => $perm,
+		'args'                => array(
+			'post_id'        => array( 'required' => true,  'type' => 'integer' ),
+			'post_type'      => array( 'required' => false, 'type' => 'string' ),
+			'canonical'      => array( 'required' => false ),
+			'robots_noindex' => array( 'required' => false, 'type' => 'string' ),
+		),
+	) );
+} );
+
+/**
+ * Byte-exact search/replace on raw post_content.
+ *
+ * The whole reason this exists: editing an href inside ACF block-comment JSON
+ * via update_post / wp_update_post() round-trips post_content through
+ * wp_slash()/kses, which re-normalizes the unicode escapes ACF stores ( ",
+ * <, \r\n, … ). That silently strips block attributes and blanks live
+ * sections (the "v1.1 blank-section trap"). So here we:
+ *   1. read post_content straight from the DB (no the_content, no client copy),
+ *   2. str_replace() each { old, new } pair sequentially on the raw bytes,
+ *   3. write back with a raw $wpdb->update() — deliberately NOT wp_update_post().
+ *
+ * Guards: dry_run defaults true; every `old` must be >= 8 bytes and != `new`;
+ * an `expect` count that doesn't match the actual match count aborts the WHOLE
+ * request (409, nothing written); max 20 pairs. No transcoding anywhere, so a
+ * literal multibyte needle (e.g. U+202F narrow no-break space) matches the exact
+ * bytes stored in the row. Trade-off: no revision entry — the response returns
+ * md5/byte counts before & after so the change stays reconstructable.
+ */
+function sitebridge_search_replace_rest( WP_REST_Request $req ) {
+	global $wpdb;
+
+	$post_id = (int) $req['post_id'];
+	if ( $post_id <= 0 ) {
+		return new WP_Error( 'bad_input', 'post_id is required', array( 'status' => 400 ) );
+	}
+
+	$replacements = $req['replacements'];
+	if ( ! is_array( $replacements ) || empty( $replacements ) ) {
+		return new WP_Error( 'bad_input', 'replacements must be a non-empty array', array( 'status' => 400 ) );
+	}
+	if ( count( $replacements ) > 20 ) {
+		return new WP_Error( 'too_many_pairs', 'Maximum 20 replacement pairs per call', array( 'status' => 400 ) );
+	}
+
+	$dry_run = ( $req['dry_run'] === null ) ? true : (bool) $req['dry_run'];
+
+	// Validate every pair up front so a bad pair aborts before any mutation.
+	$pairs = array();
+	foreach ( $replacements as $idx => $r ) {
+		if ( ! is_array( $r ) || ! array_key_exists( 'old', $r ) || ! array_key_exists( 'new', $r ) ) {
+			return new WP_Error( 'bad_pair', sprintf( 'replacements[%d] must have "old" and "new"', $idx ), array( 'status' => 400 ) );
+		}
+		$old = (string) $r['old'];
+		$new = (string) $r['new'];
+		if ( strlen( $old ) < 8 ) { // strlen() = bytes, which is what we want.
+			return new WP_Error( 'old_too_short', sprintf( 'replacements[%d].old must be at least 8 bytes (got %d)', $idx, strlen( $old ) ), array( 'status' => 400 ) );
+		}
+		if ( $old === $new ) {
+			return new WP_Error( 'noop_pair', sprintf( 'replacements[%d].old === replacements[%d].new (no-op)', $idx, $idx ), array( 'status' => 400 ) );
+		}
+		$expect = ( isset( $r['expect'] ) && $r['expect'] !== null && $r['expect'] !== '' ) ? (int) $r['expect'] : null;
+		$pairs[] = array( 'old' => $old, 'new' => $new, 'expect' => $expect );
+	}
+
+	// Read raw content straight from the DB — no filters, no client-supplied copy.
+	$content = $wpdb->get_var( $wpdb->prepare( "SELECT post_content FROM {$wpdb->posts} WHERE ID = %d", $post_id ) );
+	if ( null === $content ) {
+		return new WP_Error( 'not_found', sprintf( 'No post with ID %d', $post_id ), array( 'status' => 404 ) );
+	}
+
+	$md5_before   = md5( $content );
+	$bytes_before = strlen( $content );
+
+	// Single pass: count each pair against the working buffer (so a pair that
+	// only appears AFTER an earlier pair applied still validates), advancing the
+	// buffer as we go. Enforce every `expect` before deciding to write anything.
+	$working  = $content;
+	$report   = array();
+	$mismatch = false;
+	foreach ( $pairs as $i => $p ) {
+		$found = substr_count( $working, $p['old'] );
+		$report[] = array(
+			'old_preview' => sitebridge_sr_preview( $p['old'] ),
+			'found'       => $found,
+			'expect'      => $p['expect'],
+			'replaced'    => 0,
+		);
+		if ( $p['expect'] !== null && $found !== $p['expect'] ) {
+			$mismatch = true;
+		}
+		if ( $found > 0 ) {
+			$working             = str_replace( $p['old'], $p['new'], $working );
+			$report[ $i ]['replaced'] = $found;
+		}
+	}
+
+	// Any expect mismatch → abort the whole request, write nothing. Returned as
+	// HTTP 200 (not 4xx) on purpose: the connector surfaces the body verbatim, and
+	// the per-pair `found` counts are exactly what the caller needs to diagnose the
+	// mismatch. Callers must branch on `applied` / `aborted`, not on status code.
+	if ( $mismatch ) {
+		foreach ( $report as &$row ) {
+			$row['replaced'] = 0; // nothing was applied
+		}
+		unset( $row );
+		return array(
+			'post_id'      => $post_id,
+			'dry_run'      => $dry_run,
+			'applied'      => false,
+			'aborted'      => true,
+			'reason'       => 'expect_mismatch',
+			'pairs'        => $report,
+			'md5_before'   => $md5_before,
+			'md5_after'    => $md5_before,
+			'bytes_before' => $bytes_before,
+			'bytes_after'  => $bytes_before,
+		);
+	}
+
+	$new_content = $working;
+	$md5_after   = md5( $new_content );
+	$bytes_after = strlen( $new_content );
+
+	$applied = false;
+	if ( ! $dry_run && $md5_after !== $md5_before ) {
+		// Raw write — $wpdb->update() escapes for SQL only; it does NOT slash or
+		// kses the value, so the stored bytes are exactly $new_content.
+		$updated = $wpdb->update(
+			$wpdb->posts,
+			array( 'post_content' => $new_content ),
+			array( 'ID' => $post_id )
+		);
+		if ( false === $updated ) {
+			return new WP_Error( 'db_error', 'Database update failed', array( 'status' => 500 ) );
+		}
+		clean_post_cache( $post_id );
+		$applied = true;
+	}
+
+	return array(
+		'post_id'      => $post_id,
+		'dry_run'      => $dry_run,
+		'applied'      => $applied,
+		'pairs'        => $report,
+		'md5_before'   => $md5_before,
+		'md5_after'    => $md5_after,
+		'bytes_before' => $bytes_before,
+		'bytes_after'  => $bytes_after,
+	);
+}
+
+/** Short, safe preview of an `old` needle for the response (first ~60 bytes). */
+function sitebridge_sr_preview( $s ) {
+	$s = (string) $s;
+	return ( strlen( $s ) <= 60 ) ? $s : substr( $s, 0, 60 ) . '…';
+}
+
+/**
+ * Write Yoast canonical / robots-noindex meta server-side.
+ *
+ * title/metadesc/focuskw stay on core REST (the connector writes those and Yoast
+ * exposes them). canonical and robots-noindex are NOT dependably REST-writable,
+ * so the plugin owns them via update_post_meta()/delete_post_meta(). Partial
+ * update: only params actually passed are touched. canonical is normalized
+ * (single trailing slash stripped unless the path is "/"). Response echoes the
+ * resulting effective values so the caller can verify.
+ */
+function sitebridge_yoast_meta_rest( WP_REST_Request $req ) {
+	$post_id = (int) $req['post_id'];
+	if ( $post_id <= 0 || ! get_post( $post_id ) ) {
+		return new WP_Error( 'not_found', sprintf( 'No post with ID %d', $post_id ), array( 'status' => 404 ) );
+	}
+
+	$changed = array();
+
+	if ( $req['canonical'] !== null ) {
+		$canonical = (string) $req['canonical'];
+		if ( trim( $canonical ) === '' ) {
+			delete_post_meta( $post_id, '_yoast_wpseo_canonical' );
+			$changed[] = 'canonical';
+		} else {
+			$canonical = sitebridge_normalize_canonical( $canonical );
+			update_post_meta( $post_id, '_yoast_wpseo_canonical', $canonical );
+			$changed[] = 'canonical';
+		}
+	}
+
+	if ( $req['robots_noindex'] !== null ) {
+		$mode = strtolower( trim( (string) $req['robots_noindex'] ) );
+		$map  = array( 'noindex' => '1', 'index' => '2' ); // Yoast convention.
+		if ( $mode === 'default' ) {
+			delete_post_meta( $post_id, '_yoast_wpseo_meta-robots-noindex' );
+			$changed[] = 'robots_noindex';
+		} elseif ( isset( $map[ $mode ] ) ) {
+			update_post_meta( $post_id, '_yoast_wpseo_meta-robots-noindex', $map[ $mode ] );
+			$changed[] = 'robots_noindex';
+		} else {
+			return new WP_Error( 'bad_input', 'robots_noindex must be one of: index, noindex, default', array( 'status' => 400 ) );
+		}
+	}
+
+	if ( empty( $changed ) ) {
+		return new WP_Error( 'no_op', 'Pass at least one of: canonical, robots_noindex', array( 'status' => 400 ) );
+	}
+
+	// Read back the stored values so the caller sees ground truth.
+	$raw_robots       = get_post_meta( $post_id, '_yoast_wpseo_meta-robots-noindex', true );
+	$robots_effective = ( $raw_robots === '1' ) ? 'noindex' : ( ( $raw_robots === '2' ) ? 'index' : 'default' );
+
+	return array(
+		'post_id'   => $post_id,
+		'changed'   => $changed,
+		'effective' => array(
+			'canonical'      => (string) get_post_meta( $post_id, '_yoast_wpseo_canonical', true ),
+			'robots_noindex' => $robots_effective,
+		),
+	);
+}
+
+/**
+ * Canonical normalization guard (Feature 4). Strip a SINGLE trailing slash
+ * unless the URL path is exactly "/" (root). Scheme/host/port/query/fragment are
+ * preserved. Root-only URLs (https://example.com/) are left untouched.
+ */
+function sitebridge_normalize_canonical( $url ) {
+	$url = trim( (string) $url );
+	if ( $url === '' ) {
+		return '';
+	}
+	$parts = wp_parse_url( $url );
+	if ( ! is_array( $parts ) || ! isset( $parts['path'] ) ) {
+		return $url;
+	}
+	$path = $parts['path'];
+	if ( $path !== '/' && substr( $path, -1 ) === '/' ) {
+		$parts['path'] = substr( $path, 0, -1 ); // one slash only
+		return sitebridge_build_url( $parts );
+	}
+	return $url;
+}
+
+/** Reassemble a URL from wp_parse_url() parts (enough for canonical use). */
+function sitebridge_build_url( $p ) {
+	$url = '';
+	if ( ! empty( $p['scheme'] ) ) {
+		$url .= $p['scheme'] . '://';
+	}
+	if ( ! empty( $p['host'] ) ) {
+		$url .= $p['host'];
+		if ( ! empty( $p['port'] ) ) {
+			$url .= ':' . $p['port'];
+		}
+	}
+	if ( isset( $p['path'] ) ) {
+		$url .= $p['path'];
+	}
+	if ( ! empty( $p['query'] ) ) {
+		$url .= '?' . $p['query'];
+	}
+	if ( ! empty( $p['fragment'] ) ) {
+		$url .= '#' . $p['fragment'];
+	}
+	return $url;
 }
 
 /* ---- Admin page: Redirects dashboard (so humans can manage them too) ------- */
