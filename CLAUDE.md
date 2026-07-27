@@ -1,8 +1,9 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.10.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.13.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
-redirects**. Self-updates from GitHub releases. Host- and site-agnostic by design.
+redirects**, **byte-exact content search/replace**, **Yoast canonical/robots meta**. Self-updates
+from GitHub releases. Host- and site-agnostic by design.
 
 ## Where this sits (3 layers — don't conflate them)
 
@@ -26,15 +27,29 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.10.0)
+## REST surface (v1.13.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
 - **Nav**: `/nav`, `/nav/add-link`, `/nav/remove-link`, `/nav/replace-link` — edits the desktop ACF
-  nav option `main_nav_settings_version_2`; bumps `main_nav_version`.
+  nav option `main_nav_settings_version_2`; bumps `main_nav_version`. URL matching is trailing-slash
+  AND whitespace tolerant (`sitebridge_nav_url_eq` trims both sides); `GET /nav` also returns
+  `_untrimmed_urls` flagging any stored link URL with stray surrounding whitespace.
 - **Redirects**: `/redirects` — `GET` list, `POST` add (`source`, `target`, `type`), `DELETE` remove
   by `source`; `/redirects/import` (`POST`: `redirects`/`csv`, `replace_all`). Stored in the
   `bam_redirects` option.
+- **Content search/replace** (v1.13+): `POST /search-replace` — byte-exact `str_replace()` on **raw**
+  `post_content`. Reads via `$wpdb->get_var` (no `the_content`, no client content), writes via raw
+  `$wpdb->update` + `clean_post_cache` — deliberately NOT `wp_update_post()`, which re-normalizes ACF
+  block-comment JSON escapes and blanks blocks. Body: `post_id`, `replacements[{old,new,expect?}]`,
+  `dry_run` (default true). Per-pair `expect` mismatch aborts the WHOLE request (returned as HTTP 200
+  with `aborted:true` so the connector surfaces the per-pair `found` counts). Guards: `old` ≥ 8 bytes,
+  `old !== new`, ≤ 20 pairs. Returns `md5`/`bytes` before & after (no revision entry is created).
+- **Yoast canonical/robots** (v1.13+): `POST /yoast-meta` — writes `_yoast_wpseo_canonical` and
+  `_yoast_wpseo_meta-robots-noindex` via `update_post_meta`/`delete_post_meta` (these two keys aren't
+  dependably core-REST-writable, unlike title/metadesc/focuskw). `canonical:""` clears; robots
+  `index|noindex|default` maps to `2|1|delete`. Canonical is normalized (one trailing slash stripped
+  unless path is `/`). Partial update; returns effective values.
 
 Site-/theme-specific tailoring is centralized in the **CONFIG/PROFILE** block at the top of the
 file, overridable via `wp-config` constants / filters. Keep new tailoring there, not scattered
