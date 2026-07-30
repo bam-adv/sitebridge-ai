@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.13.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.14.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast canonical/robots meta**. Self-updates
 from GitHub releases. Host- and site-agnostic by design.
@@ -27,14 +27,35 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.13.0)
+## REST surface (v1.14.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
-- **Nav**: `/nav`, `/nav/add-link`, `/nav/remove-link`, `/nav/replace-link` — edits the desktop ACF
-  nav option `main_nav_settings_version_2`; bumps `main_nav_version`. URL matching is trailing-slash
-  AND whitespace tolerant (`sitebridge_nav_url_eq` trims both sides); `GET /nav` also returns
-  `_untrimmed_urls` flagging any stored link URL with stray surrounding whitespace.
+- **Nav**: `/nav`, `/nav/add-link`, `/nav/remove-link`, `/nav/replace-link`, `/nav/remove-item` —
+  edits the desktop ACF nav option `main_nav_settings_version_2`. (`main_nav_version` is only READ,
+  by `GET /nav` — no writer bumps it, and never has. If the theme ever keys a nav cache off that
+  field, every one of these writers needs to start bumping it.) URL
+  matching is trailing-slash AND whitespace tolerant (`sitebridge_nav_url_eq` trims both sides);
+  `GET /nav` also returns `_untrimmed_urls` flagging any stored link URL with stray surrounding
+  whitespace. Title matching (`parent_title` / `column_title` / remove-item `title`) goes through
+  `sitebridge_nav_title_eq` — case-insensitive and entity-decoding on BOTH sides, so a caller's `&`
+  matches a stored `&amp;`; titles written to storage go through `sitebridge_nav_clean_title`
+  (entity-decode → `sanitize_text_field` → trim) so `&amp;` is stored as a literal `&`.
+- **Top-level nav removal** (v1.14+): `POST /nav/remove-item` — the one destructive nav operation,
+  so it is **two-key gated**. `remove-link` still never touches top-level items (unchanged). Body:
+  `url` and/or `title` (at least one), `confirm`, `force`. Without `confirm:true` it returns a
+  PREVIEW (`removed:0`, full item JSON, nothing written). An item with a populated dropdown also
+  needs `force:true` — the 409 names the column/link counts that would be destroyed. A matcher
+  hitting >1 item aborts 409 with the match list; 0 matches is a 404 listing all top-level items.
+  Dropdown-only parents share `url:"#"`, which is why `title` exists as a matcher. Success returns
+  `removed_item` (verbatim, dropdown included — the undo path via `/nav/add-link`) and
+  `nav_items_remaining`.
+- **Nav quirk fixes** (v1.14): `/nav/replace-link` `new_url` is now OPTIONAL — pass `new_title`
+  alone for a title-only rename (response carries `title_only:true`). `/nav/add-link` takes
+  `force_new_column:true`, which appends a new column instead of matching one by title — the only
+  way to add a second blank-titled column, since a blank/whitespace `column_title` normalizes to
+  `""` and either matches the existing `""` column or 409s as ambiguous. It can't be combined with
+  `column_index`; `add-link` now also returns the resulting `column_index`.
 - **Redirects**: `/redirects` — `GET` list, `POST` add (`source`, `target`, `type`), `DELETE` remove
   by `source`; `/redirects/import` (`POST`: `redirects`/`csv`, `replace_all`). Stored in the
   `bam_redirects` option.
@@ -54,6 +75,14 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 Site-/theme-specific tailoring is centralized in the **CONFIG/PROFILE** block at the top of the
 file, overridable via `wp-config` constants / filters. Keep new tailoring there, not scattered
 through the code.
+
+## Tests
+
+`php tests/nav-acceptance.php` — 89 assertions over the whole nav module, WP/ACF stubbed in-file
+(no WordPress, no PHPUnit, no network). Covers remove-item's gates, the byte-for-byte preservation
+of untouched siblings, the add/remove round-trip, and regressions on remove-link. Run it after any
+nav change. It does NOT replace a live pass on staging — real ACF serialization and the theme's
+render are out of its reach.
 
 ## Self-updater
 
