@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.14.0
+ * Version:     1.15.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.14.0' );
+define( 'SITEBRIDGE_VERSION', '1.15.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -1431,7 +1431,9 @@ function sitebridge_redirects_rest_import( WP_REST_Request $req ) {
  * ----------------------------------------------------------------------------
  * Two write paths the connector can't safely do through core REST:
  *   POST /bam/v1/search-replace  — surgical str_replace() on raw post_content.
- *   POST /bam/v1/yoast-meta      — canonical / robots-noindex via *_post_meta.
+ *   POST /bam/v1/yoast-meta      — canonical / robots-noindex (v1.13) plus
+ *                                  seo_title / meta_description / focus_keyword
+ *                                  (v1.15, page-safe) via *_post_meta.
  * Both are gated behind manage_options, same as the redirect endpoints.
  * ========================================================================== */
 
@@ -1454,10 +1456,13 @@ add_action( 'rest_api_init', function () {
 		'callback'            => 'sitebridge_yoast_meta_rest',
 		'permission_callback' => $perm,
 		'args'                => array(
-			'post_id'        => array( 'required' => true,  'type' => 'integer' ),
-			'post_type'      => array( 'required' => false, 'type' => 'string' ),
-			'canonical'      => array( 'required' => false ),
-			'robots_noindex' => array( 'required' => false, 'type' => 'string' ),
+			'post_id'          => array( 'required' => true,  'type' => 'integer' ),
+			'post_type'        => array( 'required' => false, 'type' => 'string' ),
+			'canonical'        => array( 'required' => false ),
+			'robots_noindex'   => array( 'required' => false, 'type' => 'string' ),
+			'seo_title'        => array( 'required' => false ),
+			'meta_description' => array( 'required' => false ),
+			'focus_keyword'    => array( 'required' => false ),
 		),
 	) );
 } );
@@ -1611,14 +1616,18 @@ function sitebridge_sr_preview( $s ) {
 }
 
 /**
- * Write Yoast canonical / robots-noindex meta server-side.
+ * Write Yoast meta server-side.
  *
- * title/metadesc/focuskw stay on core REST (the connector writes those and Yoast
- * exposes them). canonical and robots-noindex are NOT dependably REST-writable,
- * so the plugin owns them via update_post_meta()/delete_post_meta(). Partial
- * update: only params actually passed are touched. canonical is normalized
- * (single trailing slash stripped unless the path is "/"). Response echoes the
- * resulting effective values so the caller can verify.
+ * canonical and robots-noindex have owned this path since v1.13 — they aren't
+ * dependably core-REST-writable at all. v1.15 pulls seo_title /
+ * meta_description / focus_keyword in as well: the core-REST route Yoast
+ * exposes for them silently drops the write on `page` post types (HTTP 200,
+ * meta never persists), so the connector needs a post-type-agnostic path with
+ * a read-back it can trust. All five go through update_post_meta()/
+ * delete_post_meta(); an empty string clears. Partial update: only params
+ * actually passed are touched. canonical is normalized (single trailing slash
+ * stripped unless the path is "/"). Response echoes the resulting effective
+ * values READ BACK from the DB so the caller can verify the write landed.
  */
 function sitebridge_yoast_meta_rest( WP_REST_Request $req ) {
 	$post_id = (int) $req['post_id'];
@@ -1654,8 +1663,27 @@ function sitebridge_yoast_meta_rest( WP_REST_Request $req ) {
 		}
 	}
 
+	// v1.15: title / metadesc / focuskw — post-type-agnostic, empty string clears.
+	$text_fields = array(
+		'seo_title'        => '_yoast_wpseo_title',
+		'meta_description' => '_yoast_wpseo_metadesc',
+		'focus_keyword'    => '_yoast_wpseo_focuskw',
+	);
+	foreach ( $text_fields as $param => $meta_key ) {
+		if ( $req[ $param ] === null ) {
+			continue;
+		}
+		$value = (string) $req[ $param ];
+		if ( trim( $value ) === '' ) {
+			delete_post_meta( $post_id, $meta_key );
+		} else {
+			update_post_meta( $post_id, $meta_key, sanitize_text_field( $value ) );
+		}
+		$changed[] = $param;
+	}
+
 	if ( empty( $changed ) ) {
-		return new WP_Error( 'no_op', 'Pass at least one of: canonical, robots_noindex', array( 'status' => 400 ) );
+		return new WP_Error( 'no_op', 'Pass at least one of: canonical, robots_noindex, seo_title, meta_description, focus_keyword', array( 'status' => 400 ) );
 	}
 
 	// Read back the stored values so the caller sees ground truth.
@@ -1666,8 +1694,11 @@ function sitebridge_yoast_meta_rest( WP_REST_Request $req ) {
 		'post_id'   => $post_id,
 		'changed'   => $changed,
 		'effective' => array(
-			'canonical'      => (string) get_post_meta( $post_id, '_yoast_wpseo_canonical', true ),
-			'robots_noindex' => $robots_effective,
+			'canonical'        => (string) get_post_meta( $post_id, '_yoast_wpseo_canonical', true ),
+			'robots_noindex'   => $robots_effective,
+			'seo_title'        => (string) get_post_meta( $post_id, '_yoast_wpseo_title', true ),
+			'meta_description' => (string) get_post_meta( $post_id, '_yoast_wpseo_metadesc', true ),
+			'focus_keyword'    => (string) get_post_meta( $post_id, '_yoast_wpseo_focuskw', true ),
 		),
 	);
 }
@@ -1716,6 +1747,186 @@ function sitebridge_build_url( $p ) {
 		$url .= '#' . $p['fragment'];
 	}
 	return $url;
+}
+
+/* ============================================================================
+ * CACHE: purge page caches after a content / redirect / nav change (v1.15)
+ * ----------------------------------------------------------------------------
+ * POST /bam/v1/purge-cache — body: optional `url` (path or absolute; per-URL
+ * purge where the engine supports it) and/or `post_id` (resolves the permalink
+ * and cleans that post's WP cache); neither = full-site purge.
+ *
+ * Why: rebuilt pages sit invisible behind cached stale renders, and some hosts
+ * ignore query-string cache-busters entirely. Detects whichever cache layers
+ * are present in THIS WordPress and fires their purge APIs. Anything upstream
+ * of PHP (CDN, external proxy) is invisible from here — an empty `detected`
+ * array is the caller's signal that the stale layer is upstream and needs a
+ * host-level purge instead.
+ * ========================================================================== */
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( SITEBRIDGE_NS, '/purge-cache', array(
+		'methods'             => 'POST',
+		'callback'            => 'sitebridge_purge_cache_rest',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+		'args'                => array(
+			'url'     => array( 'required' => false, 'type' => 'string' ),
+			'post_id' => array( 'required' => false, 'type' => 'integer' ),
+		),
+	) );
+} );
+
+function sitebridge_purge_cache_rest( WP_REST_Request $req ) {
+	$url     = ( $req['url'] !== null ) ? trim( (string) $req['url'] ) : '';
+	$post_id = ( $req['post_id'] !== null ) ? (int) $req['post_id'] : 0;
+
+	if ( $post_id > 0 ) {
+		if ( ! get_post( $post_id ) ) {
+			return new WP_Error( 'not_found', sprintf( 'No post with ID %d', $post_id ), array( 'status' => 404 ) );
+		}
+		clean_post_cache( $post_id );
+		if ( $url === '' ) {
+			$url = get_permalink( $post_id );
+		}
+	}
+
+	// A bare path becomes absolute against this site — per-URL engine APIs want
+	// the full URL.
+	if ( $url !== '' && strpos( $url, 'http://' ) !== 0 && strpos( $url, 'https://' ) !== 0 ) {
+		$url = home_url( '/' . ltrim( $url, '/' ) );
+	}
+
+	$scope    = ( $url !== '' ) ? 'url' : 'site';
+	$detected = array();
+	$fired    = array();
+	$partial  = array(); // engines detected where only a FULL purge could be fired for a url-scoped request
+
+	// --- WP Engine (mu-plugin). Varnish purge is per-post when given an ID. ----
+	if ( class_exists( 'WpeCommon' ) ) {
+		$detected[] = 'wpengine';
+		if ( method_exists( 'WpeCommon', 'purge_memcached' ) ) {
+			WpeCommon::purge_memcached();
+		}
+		if ( method_exists( 'WpeCommon', 'purge_varnish_cache' ) ) {
+			if ( $scope === 'url' && $post_id > 0 ) {
+				WpeCommon::purge_varnish_cache( $post_id );
+			} else {
+				WpeCommon::purge_varnish_cache();
+				if ( $scope === 'url' ) {
+					$partial[] = 'wpengine';
+				}
+			}
+			$fired[] = 'wpengine';
+		}
+	}
+
+	// --- Kinsta (mu-plugin). No public per-URL API — always full. -------------
+	if ( class_exists( '\Kinsta\Cache' ) ) {
+		$detected[] = 'kinsta';
+		global $kinsta_cache;
+		if ( is_object( $kinsta_cache ) && isset( $kinsta_cache->kinsta_cache_purge )
+			&& method_exists( $kinsta_cache->kinsta_cache_purge, 'purge_complete_caches' ) ) {
+			$kinsta_cache->kinsta_cache_purge->purge_complete_caches();
+			$fired[] = 'kinsta';
+			if ( $scope === 'url' ) {
+				$partial[] = 'kinsta';
+			}
+		}
+	}
+
+	// --- W3 Total Cache --------------------------------------------------------
+	if ( function_exists( 'w3tc_flush_all' ) ) {
+		$detected[] = 'w3-total-cache';
+		if ( $scope === 'url' && function_exists( 'w3tc_flush_url' ) ) {
+			w3tc_flush_url( $url );
+		} else {
+			w3tc_flush_all();
+			if ( $scope === 'url' ) {
+				$partial[] = 'w3-total-cache';
+			}
+		}
+		$fired[] = 'w3-total-cache';
+	}
+
+	// --- WP Rocket -------------------------------------------------------------
+	if ( function_exists( 'rocket_clean_domain' ) ) {
+		$detected[] = 'wp-rocket';
+		if ( $scope === 'url' && function_exists( 'rocket_clean_files' ) ) {
+			rocket_clean_files( array( $url ) );
+		} else {
+			rocket_clean_domain();
+			if ( $scope === 'url' ) {
+				$partial[] = 'wp-rocket';
+			}
+		}
+		$fired[] = 'wp-rocket';
+	}
+
+	// --- WP Super Cache --------------------------------------------------------
+	if ( function_exists( 'wp_cache_clear_cache' ) ) {
+		$detected[] = 'wp-super-cache';
+		if ( $scope === 'url' && function_exists( 'wpsc_delete_url_cache' ) ) {
+			wpsc_delete_url_cache( $url );
+		} else {
+			wp_cache_clear_cache();
+			if ( $scope === 'url' ) {
+				$partial[] = 'wp-super-cache';
+			}
+		}
+		$fired[] = 'wp-super-cache';
+	}
+
+	// --- LiteSpeed Cache (action API — safe no-op if the listener is gone) -----
+	if ( defined( 'LSCWP_V' ) || class_exists( '\LiteSpeed\Purge' ) ) {
+		$detected[] = 'litespeed';
+		if ( $scope === 'url' ) {
+			do_action( 'litespeed_purge_url', $url );
+		} else {
+			do_action( 'litespeed_purge_all' );
+		}
+		$fired[] = 'litespeed';
+	}
+
+	// --- SiteGround Optimizer (empty arg = purge everything) -------------------
+	if ( function_exists( 'sg_cachepress_purge_cache' ) ) {
+		$detected[] = 'sg-optimizer';
+		sg_cachepress_purge_cache( ( $scope === 'url' ) ? $url : '' );
+		$fired[] = 'sg-optimizer';
+	}
+
+	// --- Breeze (Cloudways). Action API — full purge only. ---------------------
+	if ( class_exists( 'Breeze_PurgeCache' ) ) {
+		$detected[] = 'breeze';
+		do_action( 'breeze_clear_all_cache' );
+		$fired[] = 'breeze';
+		if ( $scope === 'url' ) {
+			$partial[] = 'breeze';
+		}
+	}
+
+	// --- External object cache (Redis/Memcached drop-in). Full purge only:
+	// per-URL requests already ran clean_post_cache() above when post_id given. --
+	if ( $scope === 'site' && wp_using_ext_object_cache() ) {
+		$detected[] = 'object-cache';
+		wp_cache_flush();
+		$fired[] = 'object-cache';
+	}
+
+	if ( empty( $detected ) ) {
+		$note = 'No purgeable cache layer detected in WordPress — if the page is still stale, the layer is upstream (CDN/proxy) and needs a host-level purge.';
+	} elseif ( ! empty( $partial ) ) {
+		$note = sprintf( 'No per-URL purge API for: %s — fired a full-site purge there instead.', implode( ', ', array_unique( $partial ) ) );
+	} else {
+		$note = null;
+	}
+
+	return array(
+		'scope'    => $scope,
+		'url'      => ( $url !== '' ) ? $url : null,
+		'detected' => $detected,
+		'fired'    => $fired,
+		'note'     => $note,
+	);
 }
 
 /* ---- Admin page: Redirects dashboard (so humans can manage them too) ------- */

@@ -1,9 +1,10 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.14.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.15.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
-redirects**, **byte-exact content search/replace**, **Yoast canonical/robots meta**. Self-updates
-from GitHub releases. Host- and site-agnostic by design.
+redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
+title/description/focus keyword)**, **cache purging**. Self-updates from GitHub releases. Host-
+and site-agnostic by design.
 
 ## Where this sits (3 layers — don't conflate them)
 
@@ -27,7 +28,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.14.0)
+## REST surface (v1.15.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -66,11 +67,21 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   `dry_run` (default true). Per-pair `expect` mismatch aborts the WHOLE request (returned as HTTP 200
   with `aborted:true` so the connector surfaces the per-pair `found` counts). Guards: `old` ≥ 8 bytes,
   `old !== new`, ≤ 20 pairs. Returns `md5`/`bytes` before & after (no revision entry is created).
-- **Yoast canonical/robots** (v1.13+): `POST /yoast-meta` — writes `_yoast_wpseo_canonical` and
+- **Yoast meta** (v1.13+, extended v1.15): `POST /yoast-meta` — writes `_yoast_wpseo_canonical` and
   `_yoast_wpseo_meta-robots-noindex` via `update_post_meta`/`delete_post_meta` (these two keys aren't
-  dependably core-REST-writable, unlike title/metadesc/focuskw). `canonical:""` clears; robots
-  `index|noindex|default` maps to `2|1|delete`. Canonical is normalized (one trailing slash stripped
-  unless path is `/`). Partial update; returns effective values.
+  dependably core-REST-writable). `canonical:""` clears; robots `index|noindex|default` maps to
+  `2|1|delete`. Canonical is normalized (one trailing slash stripped unless path is `/`). **v1.15
+  adds `seo_title` / `meta_description` / `focus_keyword`** — the core-REST path Yoast exposes for
+  these silently drops the write on `page` post types (HTTP 200, meta never persists), so they now
+  also go through `update_post_meta` here, post-type-agnostic; empty string clears. Partial update;
+  response returns `effective` values **read back from the DB**, not an input echo.
+- **Cache purge** (v1.15+): `POST /purge-cache` — optional `url` (path or absolute; per-URL purge
+  where the engine supports it) and/or `post_id` (resolves permalink + `clean_post_cache`); neither
+  = full-site purge. Detects and fires: WP Engine, Kinsta, W3TC, WP Rocket, WP Super Cache,
+  LiteSpeed, SG Optimizer, Breeze, external object cache. Returns
+  `{scope, url, detected[], fired[], note}` — empty `detected` means the stale layer is upstream
+  (CDN/proxy) and needs a host-level purge; `note` also flags engines where a url-scoped request
+  could only fire a full purge.
 
 Site-/theme-specific tailoring is centralized in the **CONFIG/PROFILE** block at the top of the
 file, overridable via `wp-config` constants / filters. Keep new tailoring there, not scattered
