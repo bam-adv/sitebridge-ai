@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.15.0
+ * Version:     1.16.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.15.0' );
+define( 'SITEBRIDGE_VERSION', '1.16.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -1904,6 +1904,34 @@ function sitebridge_purge_cache_rest( WP_REST_Request $req ) {
 		}
 	}
 
+	// --- NitroPack. Its advanced-cache.php drop-in serves stored pages before
+	// WordPress loads, and its own auto-invalidation only hooks post saves, so
+	// options-level changes (nav, schema, redirects, Yoast meta) never trigger
+	// it. Purge explicitly — for BOTH scopes. nitropack_sdk_purge() purges the
+	// local drop-in cache AND calls NitroPack's remote API; the API call can
+	// throw, and an unreachable NitroPack must not 500 the rest of the chain.
+	// Returns false when the plugin is installed but not connected. -------------
+	if ( defined( 'NITROPACK_VERSION' )
+		&& ( function_exists( 'nitropack_sdk_purge' ) || function_exists( 'nitropack_purge' ) ) ) {
+		$detected[] = 'nitropack';
+		$np_ok = false;
+		try {
+			if ( function_exists( 'nitropack_sdk_purge' ) ) {
+				// Per-URL purge is real here (local + remote), so no $partial entry.
+				$np_ok = (bool) nitropack_sdk_purge( ( $scope === 'url' ) ? $url : null, null, 'SiteBridge purge_cache' );
+			} else {
+				// Pre-SDK NitroPack: queues a purge the plugin flushes at shutdown.
+				nitropack_purge( ( $scope === 'url' ) ? $url : null, null, 'SiteBridge purge_cache' );
+				$np_ok = true;
+			}
+		} catch ( \Throwable $e ) {
+			$np_ok = false;
+		}
+		if ( $np_ok ) {
+			$fired[] = 'nitropack';
+		}
+	}
+
 	// --- External object cache (Redis/Memcached drop-in). Full purge only:
 	// per-URL requests already ran clean_post_cache() above when post_id given. --
 	if ( $scope === 'site' && wp_using_ext_object_cache() ) {
@@ -1918,6 +1946,13 @@ function sitebridge_purge_cache_rest( WP_REST_Request $req ) {
 		$note = sprintf( 'No per-URL purge API for: %s — fired a full-site purge there instead.', implode( ', ', array_unique( $partial ) ) );
 	} else {
 		$note = null;
+	}
+
+	// Detected-but-not-fired must be visible: a NitroPack miss looks exactly
+	// like a successful purge to the caller otherwise.
+	if ( in_array( 'nitropack', $detected, true ) && ! in_array( 'nitropack', $fired, true ) ) {
+		$np_note = 'NitroPack detected but its purge did not fire (plugin not connected, or its API unreachable) — pages may stay stale until NitroPack is purged from its own dashboard.';
+		$note    = ( $note === null ) ? $np_note : $note . ' ' . $np_note;
 	}
 
 	return array(

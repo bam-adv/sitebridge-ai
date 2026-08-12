@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.15.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.16.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**. Self-updates from GitHub releases. Host-
@@ -28,7 +28,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.15.0)
+## REST surface (v1.16.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -78,10 +78,14 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Cache purge** (v1.15+): `POST /purge-cache` — optional `url` (path or absolute; per-URL purge
   where the engine supports it) and/or `post_id` (resolves permalink + `clean_post_cache`); neither
   = full-site purge. Detects and fires: WP Engine, Kinsta, W3TC, WP Rocket, WP Super Cache,
-  LiteSpeed, SG Optimizer, Breeze, external object cache. Returns
+  LiteSpeed, SG Optimizer, Breeze, NitroPack (v1.16+), external object cache. Returns
   `{scope, url, detected[], fired[], note}` — empty `detected` means the stale layer is upstream
   (CDN/proxy) and needs a host-level purge; `note` also flags engines where a url-scoped request
-  could only fire a full purge.
+  could only fire a full purge. **NitroPack is special**: its drop-in serves pages before WP loads
+  and its auto-invalidation only hooks post saves, so options-level changes need this explicit
+  purge; the purge calls NitroPack's remote API, so the branch is `try/catch`-guarded — on failure
+  (or plugin-installed-but-not-connected) `nitropack` appears in `detected` but not `fired`, and
+  the `note` says so. Its per-URL purge is real (local drop-in + remote), so no `partial` there.
 
 Site-/theme-specific tailoring is centralized in the **CONFIG/PROFILE** block at the top of the
 file, overridable via `wp-config` constants / filters. Keep new tailoring there, not scattered
@@ -94,6 +98,11 @@ through the code.
 of untouched siblings, the add/remove round-trip, and regressions on remove-link. Run it after any
 nav change. It does NOT replace a live pass on staging — real ACF serialization and the theme's
 render are out of its reach.
+
+`php tests/purge-acceptance.php` — the purge route's NitroPack branch, one subprocess per
+`function_exists()`/`defined()` state (present/connected, disconnected, API-throws, legacy
+`nitropack_purge()`, absent). The absent scenario doubles as the no-behavior-change check for
+non-NitroPack hosts (WP Engine sites must return byte-identical purge responses).
 
 ## Self-updater
 
