@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.16.0
+ * Version:     1.17.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.16.0' );
+define( 'SITEBRIDGE_VERSION', '1.17.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -53,6 +53,15 @@ if ( ! defined( 'SITEBRIDGE_NAV_VERSION_FIELD' ) ) define( 'SITEBRIDGE_NAV_VERSI
 
 // --- Redirects (kept as legacy option key for data compatibility) ------------
 if ( ! defined( 'SITEBRIDGE_REDIRECTS_OPTION' ) )  define( 'SITEBRIDGE_REDIRECTS_OPTION', 'bam_redirects' );
+
+// --- Hero exclusivity (Culligan v4 theme profile) -----------------------------
+// A page renders its hero EITHER from an acf/hero-banner block in post_content
+// OR from the page-level meta-box group toggled by show_hero_banner. Both at
+// once double-renders the hero, so /acf-fields refuses to set the toggle true
+// on a page that already carries the block. Set either constant to '' in
+// wp-config to disable the guard on themes without this pattern.
+if ( ! defined( 'SITEBRIDGE_HERO_BLOCK' ) )  define( 'SITEBRIDGE_HERO_BLOCK', 'acf/hero-banner' );
+if ( ! defined( 'SITEBRIDGE_HERO_TOGGLE' ) ) define( 'SITEBRIDGE_HERO_TOGGLE', 'show_hero_banner' );
 
 // --- REST namespaces (kept legacy so the deployed connector keeps working) ---
 const SITEBRIDGE_NS        = 'bam/v1';
@@ -1747,6 +1756,269 @@ function sitebridge_build_url( $p ) {
 		$url .= '#' . $p['fragment'];
 	}
 	return $url;
+}
+
+/* ============================================================================
+ * ACF FIELDS: safe page-level (meta-box) field writes (v1.17)
+ * ----------------------------------------------------------------------------
+ * POST /bam/v1/acf-fields — body: post_id, fields { name-or-key: value },
+ * optional clear_stale_rows (default true).
+ *
+ * Why core REST can't do this: ACF's REST layer resolves the sub-fields of a
+ * seamless clone with COMPOSITE keys ("{cloneKey}_{subKey}"), and
+ * acf_update_value() writes whatever key it was handed into the "_"-prefixed
+ * reference row in postmeta. The front end resolves values THROUGH that
+ * reference (get_field → "_hero_banner_badges" → acf_get_field(key)); a
+ * composite key doesn't resolve outside the REST/clone loading context, so the
+ * template renders nothing — while REST read-back, which re-derives fields from
+ * the group schema and never consults the reference rows, keeps reporting the
+ * written values as if all were well. Verified against ACF PRO 6.8.4
+ * (rest-api/class-acf-rest-api.php::update_fields() resolves via
+ * acf_search_fields() over the clone-flattened composite-key fields;
+ * acf-value-functions.php::acf_update_value() stores $field['key'] as the
+ * reference). Same root cause as the July 2026 hero-rollout pointer
+ * corruption, where connector writes prepended the clone key as a prefix.
+ *
+ * So here we:
+ *   1. resolve every incoming selector to its REAL field object up front
+ *      (acf_get_field by key or by name; composite keys are refused) — any
+ *      unresolvable selector aborts the whole request before a single write,
+ *   2. write through update_field() with the field KEY, so ACF stores value
+ *      AND reference rows exactly as an admin save does,
+ *   3. repair any composite-corrupted reference row already on the post
+ *      (damage left by past core-REST writes — every write self-heals the page),
+ *   4. delete the stale higher-index rows a shrinking repeater leaves behind,
+ *   5. read the result back THROUGH the reference rows — the same resolution
+ *      path the front-end template uses — so `reference_ok` in the response is
+ *      a render-truthful verification, not an input echo,
+ *   6. return post_content md5 before/after to prove content was untouched.
+ *
+ * Partial update is guaranteed by construction: the loop only ever calls
+ * update_field() for selectors present in `fields`.
+ * ========================================================================== */
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( SITEBRIDGE_NS, '/acf-fields', array(
+		'methods'             => 'POST',
+		'callback'            => 'sitebridge_acf_fields_rest',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+		'args'                => array(
+			'post_id'          => array( 'required' => true,  'type' => 'integer' ),
+			'fields'           => array( 'required' => true ),
+			'clear_stale_rows' => array( 'required' => false, 'type' => 'boolean' ),
+		),
+	) );
+} );
+
+function sitebridge_acf_fields_rest( WP_REST_Request $req ) {
+	global $wpdb;
+
+	if ( ! function_exists( 'update_field' ) || ! function_exists( 'acf_get_field' ) ) {
+		return new WP_Error( 'acf_missing', 'ACF is not active', array( 'status' => 500 ) );
+	}
+
+	$post_id = (int) $req['post_id'];
+	$post    = $post_id > 0 ? get_post( $post_id ) : null;
+	if ( ! $post ) {
+		return new WP_Error( 'not_found', sprintf( 'No post with ID %d', $post_id ), array( 'status' => 404 ) );
+	}
+
+	$fields = $req['fields'];
+	if ( ! is_array( $fields ) || empty( $fields ) ) {
+		return new WP_Error( 'bad_input', 'fields must be a non-empty object of { field-name-or-key: value }', array( 'status' => 400 ) );
+	}
+	if ( count( $fields ) > 20 ) {
+		return new WP_Error( 'too_many_fields', 'Maximum 20 fields per call', array( 'status' => 400 ) );
+	}
+
+	$clear_stale = ( $req['clear_stale_rows'] === null ) ? true : (bool) $req['clear_stale_rows'];
+
+	$md5_before = md5( (string) $post->post_content );
+
+	// Resolve every selector up front — one bad selector aborts before any write.
+	$resolved = array();
+	foreach ( $fields as $selector => $value ) {
+		$field = acf_get_field( $selector );
+		if ( ! $field || empty( $field['key'] ) || empty( $field['name'] ) ) {
+			return new WP_Error(
+				'unknown_field',
+				sprintf( '"%s" does not resolve to a registered ACF field on this site. Pass the field name (e.g. "hero_banner_badges") or its real field key.', $selector ),
+				array( 'status' => 400 )
+			);
+		}
+		// A composite clone key ("field_X_field_Y") is exactly the corruption
+		// this route exists to prevent — refuse to write through one.
+		if ( substr_count( $field['key'], 'field_' ) > 1 ) {
+			return new WP_Error(
+				'composite_key',
+				sprintf( '"%s" resolved to composite clone key "%s". Refusing: writing through it corrupts the field reference rows. Use the field\'s own name or key.', $selector, $field['key'] ),
+				array( 'status' => 409 )
+			);
+		}
+		$resolved[] = array( 'field' => $field, 'value' => $value );
+	}
+
+	// Hero exclusivity guard (theme profile, see CONFIG): a page that renders the
+	// hero from a block must not also enable the meta-box hero — double render.
+	if ( SITEBRIDGE_HERO_BLOCK !== '' && SITEBRIDGE_HERO_TOGGLE !== '' ) {
+		foreach ( $resolved as $r ) {
+			if ( $r['field']['name'] === SITEBRIDGE_HERO_TOGGLE
+				&& ! empty( $r['value'] )
+				&& strpos( (string) $post->post_content, '<!-- wp:' . SITEBRIDGE_HERO_BLOCK ) !== false ) {
+				return new WP_Error(
+					'hero_conflict',
+					sprintf( 'Post %d contains a %s block; enabling %s as well would render the hero twice. Leave the toggle false on block pages (the block is the hero).', $post_id, SITEBRIDGE_HERO_BLOCK, SITEBRIDGE_HERO_TOGGLE ),
+					array( 'status' => 409 )
+				);
+			}
+		}
+	}
+
+	$results = array();
+	foreach ( $resolved as $r ) {
+		$field = $r['field'];
+		$name  = $field['name'];
+
+		$stale_deleted = 0;
+		$before_count  = ( $field['type'] === 'repeater' ) ? (int) get_post_meta( $post_id, $name, true ) : null;
+
+		// The write. Return value is NOT the verification (update_metadata()
+		// returns false on an unchanged value) — the read-back below is.
+		update_field( $field['key'], $r['value'], $post_id );
+
+		// A shrinking repeater leaves its old higher-index rows behind. ACF
+		// ignores them (the count row governs) but they accumulate — clear them.
+		if ( $clear_stale && $field['type'] === 'repeater' && is_array( $r['value'] ) ) {
+			$after_count = count( $r['value'] );
+			if ( $before_count !== null && $after_count < $before_count ) {
+				foreach ( array( '', '_' ) as $prefix ) {
+					for ( $i = $after_count; $i < $before_count; $i++ ) {
+						$like = $wpdb->esc_like( $prefix . $name . '_' . $i . '_' ) . '%';
+						$stale_deleted += (int) $wpdb->query( $wpdb->prepare(
+							"DELETE FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key LIKE %s",
+							$post_id,
+							$like
+						) );
+					}
+				}
+			}
+		}
+
+		$results[ $name ] = array(
+			'field_key'          => $field['key'],
+			'type'               => $field['type'],
+			'stale_rows_deleted' => $stale_deleted,
+		);
+	}
+
+	// Heal composite-corrupted reference rows anywhere on this post (including
+	// fields this call didn't touch) left behind by past core-REST writes.
+	$repaired = sitebridge_acf_repair_references( $post_id );
+
+	clean_post_cache( $post_id );
+
+	// Read back through the reference rows — the front end's resolution path.
+	foreach ( $resolved as $r ) {
+		$results[ $r['field']['name'] ]['state'] = sitebridge_acf_field_state( $post_id, $r['field'] );
+	}
+
+	// Fresh from the DB: prove post_content was untouched by the whole call.
+	$content_after = (string) $wpdb->get_var( $wpdb->prepare( "SELECT post_content FROM {$wpdb->posts} WHERE ID = %d", $post_id ) );
+	$md5_after     = md5( $content_after );
+
+	return array(
+		'post_id'             => $post_id,
+		'fields'              => $results,
+		'repaired_references' => $repaired,
+		'content_md5_before'  => $md5_before,
+		'content_md5_after'   => $md5_after,
+		'content_untouched'   => ( $md5_before === $md5_after ),
+	);
+}
+
+/**
+ * Repair "_"-prefixed field reference rows corrupted with composite clone keys
+ * ("field_X_field_Y..."). Legitimate references on this theme are single field
+ * keys; a composite value is always damage from an ACF REST clone write. The
+ * repair strips to the FINAL "field_..." segment, and only applies when that
+ * candidate resolves to a registered field whose name matches the row it would
+ * govern (the row key must end in "_{field name}", which holds for both
+ * top-level rows like "_show_hero_banner" and repeater sub-rows like
+ * "_hero_banner_badges_0_badge_image"). Anything that doesn't match both
+ * checks is left alone and reported as skipped.
+ */
+function sitebridge_acf_repair_references( $post_id ) {
+	global $wpdb;
+
+	$rows = $wpdb->get_results( $wpdb->prepare(
+		"SELECT meta_id, meta_key, meta_value FROM {$wpdb->postmeta}
+		 WHERE post_id = %d AND meta_key LIKE %s AND meta_value LIKE %s",
+		$post_id,
+		$wpdb->esc_like( '_' ) . '%',
+		$wpdb->esc_like( 'field_' ) . '%' . $wpdb->esc_like( '_field_' ) . '%'
+	) );
+
+	$repaired = array();
+	foreach ( $rows as $row ) {
+		$pos       = strrpos( $row->meta_value, 'field_' );
+		$candidate = substr( $row->meta_value, $pos );
+		$field     = ( $candidate !== $row->meta_value ) ? acf_get_field( $candidate ) : false;
+
+		$entry = array(
+			'meta_key' => $row->meta_key,
+			'from'     => $row->meta_value,
+			'to'       => $candidate,
+		);
+
+		if ( ! $field || $field['key'] !== $candidate
+			|| substr( $row->meta_key, -strlen( '_' . $field['name'] ) ) !== '_' . $field['name'] ) {
+			$entry['repaired'] = false;
+			$repaired[]        = $entry;
+			continue;
+		}
+
+		update_metadata_by_mid( 'post', $row->meta_id, $candidate );
+		$entry['repaired'] = true;
+		$repaired[]        = $entry;
+	}
+	return $repaired;
+}
+
+/**
+ * Render-truthful state of one field on one post: the raw value row, the
+ * reference row, and whether that reference resolves back to the field — i.e.
+ * whether get_field() on the front end will find it. For repeaters, the same
+ * per-row for every sub-field of every row the count says exists.
+ */
+function sitebridge_acf_field_state( $post_id, $field ) {
+	$name      = $field['name'];
+	$value     = get_post_meta( $post_id, $name, true );
+	$reference = (string) get_post_meta( $post_id, '_' . $name, true );
+
+	$state = array(
+		'value'        => $value,
+		'reference'    => $reference,
+		'reference_ok' => ( $reference === $field['key'] ),
+	);
+
+	if ( $field['type'] === 'repeater' && ! empty( $field['sub_fields'] ) ) {
+		$count         = (int) $value;
+		$state['rows'] = array();
+		for ( $i = 0; $i < $count; $i++ ) {
+			$row = array();
+			foreach ( $field['sub_fields'] as $sub ) {
+				$sub_name = $name . '_' . $i . '_' . $sub['name'];
+				$sub_ref  = (string) get_post_meta( $post_id, '_' . $sub_name, true );
+				$row[ $sub['name'] ] = array(
+					'value'        => get_post_meta( $post_id, $sub_name, true ),
+					'reference'    => $sub_ref,
+					'reference_ok' => ( $sub_ref === $sub['key'] ),
+				);
+			}
+			$state['rows'][] = $row;
+		}
+	}
+	return $state;
 }
 
 /* ============================================================================
