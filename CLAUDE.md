@@ -1,10 +1,10 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.16.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.17.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
-title/description/focus keyword)**, **cache purging**. Self-updates from GitHub releases. Host-
-and site-agnostic by design.
+title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
+writes**. Self-updates from GitHub releases. Host- and site-agnostic by design.
 
 ## Where this sits (3 layers — don't conflate them)
 
@@ -14,9 +14,11 @@ and site-agnostic by design.
 3. **Claude chat skills** (`content-publish`, `schema-deploy`, …) — live in Devon's Claude settings,
    not in any repo; they drive layer 2.
 
-Posts / media / Yoast / ACF-field reads the connector does are **core WP + ACF REST**, not this
-plugin — this plugin only owns schema + nav + redirects. (The theme's hero meta-box→block migration
-is unrelated to this plugin; its notes live in the content-publish skill.)
+Posts / media / ACF-field READS the connector does are **core WP + ACF REST**, not this plugin.
+ACF-field WRITES are this plugin's job since v1.17 (`/acf-fields`) — the core-REST `acf` write
+path corrupts field reference rows on seamless-clone groups and must not be used (see the route's
+docblock). (The theme's hero meta-box→block migration is unrelated to this plugin; its notes live
+in the content-publish skill.)
 
 ## Heritage / compatibility (don't break)
 
@@ -28,7 +30,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.16.0)
+## REST surface (v1.17.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -75,6 +77,24 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   these silently drops the write on `page` post types (HTTP 200, meta never persists), so they now
   also go through `update_post_meta` here, post-type-agnostic; empty string clears. Partial update;
   response returns `effective` values **read back from the DB**, not an input echo.
+- **ACF fields** (v1.17+): `POST /acf-fields` — body: `post_id`, `fields` `{name-or-key: value}`
+  (max 20), optional `clear_stale_rows` (default true). The ONLY safe write path for page-level
+  (meta-box) ACF fields: core REST's `acf` key resolves seamless-clone sub-fields with COMPOSITE
+  keys (`{cloneKey}_{subKey}`) and stores them into the `_`-prefixed reference rows, which the
+  front end can't resolve — repeaters render nothing while REST read-back (which never consults
+  the reference rows) reports success (verified against ACF PRO 6.8.4; the July 2026 hero-rollout
+  "pointer prefix" corruption is the same bug). The route resolves each selector to its REAL field
+  via `acf_get_field()` (composite keys refused, unknown selectors abort the whole request before
+  any write), writes through `update_field()` with the field KEY, deletes stale higher-index rows
+  when a repeater shrinks, and **repairs** any composite-corrupted reference row on the post
+  (self-healing, reported in `repaired_references` — only when the composite's tail resolves to a
+  registered field whose name matches the row). Partial update by construction. Response verifies
+  **through the reference rows** (the front end's resolution path): per-field `state` with
+  `reference_ok` (+ per-row sub-field states for repeaters), plus `content_md5_before/after` +
+  `content_untouched` proving `post_content` wasn't touched. Hero exclusivity guard (CONFIG:
+  `SITEBRIDGE_HERO_BLOCK`/`SITEBRIDGE_HERO_TOGGLE`, Culligan profile, '' disables): setting the
+  toggle true on a post whose content carries the hero block → 409 `hero_conflict` (double
+  render); setting it false is the sanctioned state on block pages.
 - **Cache purge** (v1.15+): `POST /purge-cache` — optional `url` (path or absolute; per-URL purge
   where the engine supports it) and/or `post_id` (resolves permalink + `clean_post_cache`); neither
   = full-site purge. Detects and fires: WP Engine, Kinsta, W3TC, WP Rocket, WP Super Cache,
@@ -98,6 +118,13 @@ through the code.
 of untouched siblings, the add/remove round-trip, and regressions on remove-link. Run it after any
 nav change. It does NOT replace a live pass on staging — real ACF serialization and the theme's
 render are out of its reach.
+
+`php tests/acf-fields-acceptance.php` — 35 assertions over the `/acf-fields` route with an ACF
+storage emulation faithful to real persistence (value rows, `_`-reference rows holding field
+keys, repeater count + `{name}_{i}_{sub}` rows). Covers the five handoff acceptance criteria in
+logic form, reference-row repair (healed + skipped), the hero guard, and all-or-nothing input
+validation. Its live assumptions (sub-field keys resolve individually via `acf_get_field()`;
+composite keys return false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 
 `php tests/purge-acceptance.php` — the purge route's NitroPack branch, one subprocess per
 `function_exists()`/`defined()` state (present/connected, disconnected, API-throws, legacy
