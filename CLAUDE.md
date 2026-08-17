@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.17.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.17.1**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -30,7 +30,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.17.0)
+## REST surface (v1.17.1)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -91,7 +91,20 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   registered field whose name matches the row). Partial update by construction. Response verifies
   **through the reference rows** (the front end's resolution path): per-field `state` with
   `reference_ok` (+ per-row sub-field states for repeaters), plus `content_md5_before/after` +
-  `content_untouched` proving `post_content` wasn't touched. Hero exclusivity guard (CONFIG:
+  `content_untouched` proving `post_content` wasn't touched.
+  **v1.17.1** — two fixes from the fleet hero rollout: (a) **`null` is normalized** to ACF's empty
+  value (`""`, or `[]` for repeater/group/flexible) everywhere in `fields` before any write —
+  passing `null` for an empty image sub-field used to leave a value/reference pair the front end
+  resolves to nothing; the count comes back per field as `nulls_normalized`. (b) The stale-row
+  counter told the truth but not the whole one: ACF PRO's own repeater `update_value()` deletes
+  rows `[new..old)` for sub-fields still in the group *before* this route's sweep runs, so
+  `stale_rows_deleted` is legitimately **0** on a clean shrink. The response now also carries
+  **`stale_rows_found`** — rows above the incoming row count, measured pre-write — which is the
+  number a caller actually wants; `stale_rows_deleted` stays what the route itself removed, i.e.
+  what ACF can't see: sub-fields since dropped from the group, and rows orphaned above a stale
+  count row (the sweep now scans by real row index, not the old `[after,before)` window). Rows of
+  a neighbouring field whose name collides with a row index (`{name}_2_…` vs field `{name}_2`) are
+  excluded — the index is skipped when `{name}_{i}` resolves to a registered field. Hero exclusivity guard (CONFIG:
   `SITEBRIDGE_HERO_BLOCK`/`SITEBRIDGE_HERO_TOGGLE`, Culligan profile, '' disables): setting the
   toggle true on a post whose content carries the hero block → 409 `hero_conflict` (double
   render); setting it false is the sanctioned state on block pages.
@@ -119,12 +132,16 @@ of untouched siblings, the add/remove round-trip, and regressions on remove-link
 nav change. It does NOT replace a live pass on staging — real ACF serialization and the theme's
 render are out of its reach.
 
-`php tests/acf-fields-acceptance.php` — 35 assertions over the `/acf-fields` route with an ACF
+`php tests/acf-fields-acceptance.php` — 54 assertions over the `/acf-fields` route with an ACF
 storage emulation faithful to real persistence (value rows, `_`-reference rows holding field
-keys, repeater count + `{name}_{i}_{sub}` rows). Covers the five handoff acceptance criteria in
-logic form, reference-row repair (healed + skipped), the hero guard, and all-or-nothing input
-validation. Its live assumptions (sub-field keys resolve individually via `acf_get_field()`;
-composite keys return false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
+keys, repeater count + `{name}_{i}_{sub}` rows, **and ACF's own shrink cleanup** — the stub
+deletes rows `[new..old)` for registered sub-fields, as `acf-field-repeater.php::delete_row`
+does, which is what makes the v1.17.1 counter behavior testable). Covers the five handoff
+acceptance criteria in logic form, reference-row repair (healed + skipped), the hero guard,
+all-or-nothing input validation, null normalization, and the stale-row sweep (orphans ACF can't
+see, the same-prefix sibling field it must not touch, `clear_stale_rows:false`). Its live
+assumptions (sub-field keys resolve individually via `acf_get_field()`; composite keys return
+false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 
 `php tests/purge-acceptance.php` — the purge route's NitroPack branch, one subprocess per
 `function_exists()`/`defined()` state (present/connected, disconnected, API-throws, legacy

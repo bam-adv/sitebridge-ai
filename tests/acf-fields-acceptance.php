@@ -1,6 +1,6 @@
 <?php
 /**
- * Acceptance harness for the ACF-FIELDS route (v1.17.0).
+ * Acceptance harness for the ACF-FIELDS route (v1.17.1).
  *
  * No WordPress, no ACF, no PHPUnit, no network: stubs enough WP to load
  * sitebridge-ai.php, plus an ACF storage emulation faithful to how ACF PRO
@@ -110,6 +110,16 @@ function meta_set( $key, $value ) {
 		'meta_value' => (string) $value,
 	);
 }
+function meta_delete( $key ) {
+	foreach ( $GLOBALS['meta_rows'] as $i => $row ) {
+		if ( $row->meta_key === $key ) {
+			unset( $GLOBALS['meta_rows'][ $i ] );
+			$GLOBALS['meta_rows'] = array_values( $GLOBALS['meta_rows'] );
+			return true;
+		}
+	}
+	return false;
+}
 function meta_get( $key ) {
 	foreach ( $GLOBALS['meta_rows'] as $row ) {
 		if ( $row->meta_key === $key ) {
@@ -148,8 +158,9 @@ function update_metadata_by_mid( $type, $mid, $value ) {
 }
 
 // ------------------------------------------------------------- $wpdb stub ---
-// Supports exactly the three query shapes the route issues: the corrupted-
-// reference SELECT, the stale-row DELETE, and the post_content get_var.
+// Supports exactly the query shapes the route issues: the corrupted-reference
+// SELECT, the repeater-row SELECT, the stale-row DELETE (by exact key list),
+// and the post_content get_var.
 function sql_like_to_regex( $pattern ) {
 	// Unescape SQL-LIKE escapes, then translate wildcards.
 	$regex = '';
@@ -174,31 +185,46 @@ class FakeWpdb {
 	public $posts    = 'wp_posts';
 	public $last_args;
 	public function prepare( $sql, ...$args ) {
+		// Real wpdb::prepare() flattens a single array argument — the route
+		// relies on that for its variable-length IN list.
+		if ( count( $args ) === 1 && is_array( $args[0] ) ) {
+			$args = $args[0];
+		}
 		// Keep sql + args separate; our executors parse args positionally.
 		$this->last_args = $args;
 		return array( 'sql' => $sql, 'args' => $args );
 	}
 	public function esc_like( $s ) { return addcslashes( $s, '_%\\' ); }
 	public function get_results( $q ) {
-		// SELECT meta_id, meta_key, meta_value ... WHERE post_id=%d AND meta_key LIKE %s AND meta_value LIKE %s
-		list( , $key_like, $value_like ) = array( $q['args'][0], $q['args'][1], $q['args'][2] );
-		$key_re   = sql_like_to_regex( $key_like );
-		$value_re = sql_like_to_regex( $value_like );
-		$out      = array();
+		if ( strpos( $q['sql'], 'meta_value LIKE' ) !== false ) {
+			// SELECT ... WHERE post_id=%d AND meta_key LIKE %s AND meta_value LIKE %s
+			$key_re   = sql_like_to_regex( $q['args'][1] );
+			$value_re = sql_like_to_regex( $q['args'][2] );
+			$out      = array();
+			foreach ( $GLOBALS['meta_rows'] as $row ) {
+				if ( preg_match( $key_re, $row->meta_key ) && preg_match( $value_re, $row->meta_value ) ) {
+					$out[] = $row;
+				}
+			}
+			return $out;
+		}
+		// SELECT ... WHERE post_id=%d AND ( meta_key LIKE %s OR meta_key LIKE %s )
+		$re_a = sql_like_to_regex( $q['args'][1] );
+		$re_b = sql_like_to_regex( $q['args'][2] );
+		$out  = array();
 		foreach ( $GLOBALS['meta_rows'] as $row ) {
-			if ( preg_match( $key_re, $row->meta_key ) && preg_match( $value_re, $row->meta_value ) ) {
+			if ( preg_match( $re_a, $row->meta_key ) || preg_match( $re_b, $row->meta_key ) ) {
 				$out[] = $row;
 			}
 		}
 		return $out;
 	}
 	public function query( $q ) {
-		// DELETE ... WHERE post_id=%d AND meta_key LIKE %s
-		$like = $q['args'][1];
-		$re   = sql_like_to_regex( $like );
+		// DELETE ... WHERE post_id=%d AND meta_key IN ( %s, %s, … )
+		$keys = array_slice( $q['args'], 1 );
 		$n    = 0;
 		foreach ( $GLOBALS['meta_rows'] as $i => $row ) {
-			if ( preg_match( $re, $row->meta_key ) ) {
+			if ( in_array( $row->meta_key, $keys, true ) ) {
 				unset( $GLOBALS['meta_rows'][ $i ] );
 				$n++;
 			}
@@ -241,6 +267,17 @@ acf_register_test_field( array(
 		array( 'key' => 'field_61379f3453de1', 'name' => 'headline', 'type' => 'text' ),
 	),
 ) );
+// A sibling field whose NAME collides with a row index of the repeater above
+// ("hero_banner_badges" row 2 vs the field "hero_banner_badges_2") — its rows
+// must survive the stale-row sweep.
+acf_register_test_field( array(
+	'key'        => 'field_6cafe0000002',
+	'name'       => 'hero_banner_badges_2',
+	'type'       => 'repeater',
+	'sub_fields' => array(
+		array( 'key' => 'field_6cafe0000003', 'name' => 'badge_image', 'type' => 'image' ),
+	),
+) );
 // A clone-flattened composite-key field, as ACF's REST layer would resolve it —
 // what the route must REFUSE to write through.
 acf_register_test_field( array(
@@ -274,8 +311,13 @@ function acf_get_field( $selector ) {
 
 // Faithful to ACF PRO's storage semantics for the types used here: value row
 // under the field NAME, reference row "_{name}" = field KEY; repeaters store
-// the row count and one row per sub-field per row. A shrinking repeater does
-// NOT remove old higher-index rows (that is the route's job).
+// the row count and one row per sub-field per row.
+//
+// On a shrink, ACF PRO's repeater update_value() deletes rows [new..old) for
+// every sub-field CURRENTLY IN THE GROUP (acf-field-repeater.php::delete_row →
+// acf_delete_value, which drops the value row and its reference). Rows it
+// cannot know about — sub-fields since removed from the group, or rows sitting
+// above the count row — survive, and clearing those is the route's job.
 function update_field( $key, $value, $post_id = false ) {
 	$field = acf_get_field( $key );
 	if ( ! $field ) {
@@ -283,9 +325,16 @@ function update_field( $key, $value, $post_id = false ) {
 	}
 	$name = $field['name'];
 	if ( $field['type'] === 'repeater' && is_array( $value ) ) {
-		$rows = array_values( $value );
+		$rows      = array_values( $value );
+		$old_count = (int) meta_get( $name );
 		meta_set( $name, count( $rows ) );
 		meta_set( '_' . $name, $field['key'] );
+		for ( $i = count( $rows ); $i < $old_count; $i++ ) {
+			foreach ( $field['sub_fields'] as $sub ) {
+				meta_delete( $name . '_' . $i . '_' . $sub['name'] );
+				meta_delete( '_' . $name . '_' . $i . '_' . $sub['name'] );
+			}
+		}
 		foreach ( $rows as $i => $row ) {
 			foreach ( $field['sub_fields'] as $sub ) {
 				$v = null;
@@ -365,7 +414,8 @@ ok( meta_get( 'hero_banner_badges_0_badge_image' ) === '4419', 'row 0 has the ne
 ok( meta_get( '_hero_banner_badges_0_badge_image' ) === 'field_61bce179a13a7', 'row 0 reference holds the real sub key' );
 ok( meta_get( 'hero_banner_badges_1_badge_image' ) === null, 'stale row 1 value deleted (2→1 shrink cleanup)' );
 ok( meta_get( '_hero_banner_badges_1_badge_image' ) === null, 'stale row 1 reference deleted' );
-ok( $r['fields']['hero_banner_badges']['stale_rows_deleted'] === 2, 'response reports 2 stale rows deleted' );
+ok( $r['fields']['hero_banner_badges']['stale_rows_found'] === 2, 'response reports the 2 rows the shrink stranded' );
+ok( $r['fields']['hero_banner_badges']['stale_rows_deleted'] === 0, "…and 0 swept by the route — ACF's own update_value already cleared them" );
 $st = $r['fields']['hero_banner_badges']['state'];
 ok( $st['reference_ok'] === true, 'state: reference_ok true' );
 ok( count( $st['rows'] ) === 1 && $st['rows'][0]['badge_image']['reference_ok'] === true, 'state: 1 row, sub reference_ok true' );
@@ -459,16 +509,72 @@ for ( $i = 0; $i < 21; $i++ ) { $too_many[ "f$i" ] = 1; }
 $r = sitebridge_acf_fields_rest( req( array( 'post_id' => 42, 'fields' => $too_many ) ) );
 ok( is_wp_error( $r ) && $r->get_error_code() === 'too_many_fields', '>20 fields → too_many_fields' );
 
-echo "\n\033[1mscenario: clear_stale_rows=false leaves shrink leftovers\033[0m\n";
-meta_reset( healthy_seed(), $CONTENT );
+echo "\n\033[1mscenario: rows ACF cannot see are what the sweep is for\033[0m\n";
+// A sub-field since removed from the group (ACF's delete_row never visits it)
+// and a row orphaned ABOVE the count row (ACF's shrink loop stops at old count).
+$orphans = healthy_seed() + array();
+$orphans['hero_banner_badges_1_badge_link']   = 'https://example.com/old';
+$orphans['_hero_banner_badges_1_badge_link']  = 'field_deadbeef0000';
+$orphans['hero_banner_badges_3_badge_image']  = '9999';
+$orphans['_hero_banner_badges_3_badge_image'] = 'field_61bce179a13a7';
+meta_reset( $orphans, $CONTENT );
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'hero_banner_badges' => array( array( 'badge_image' => 4419 ) ) ),
+) ) );
+ok( ! is_wp_error( $r ), 'write succeeds' );
+ok( $r['fields']['hero_banner_badges']['stale_rows_found'] === 6, 'all 6 rows at index >= 1 counted before the write' );
+ok( $r['fields']['hero_banner_badges']['stale_rows_deleted'] === 4, 'the 4 ACF left behind are swept (2 dead sub-field + 2 above the count row)' );
+ok( meta_get( 'hero_banner_badges_1_badge_link' ) === null && meta_get( '_hero_banner_badges_1_badge_link' ) === null, 'dead sub-field rows gone' );
+ok( meta_get( 'hero_banner_badges_3_badge_image' ) === null && meta_get( '_hero_banner_badges_3_badge_image' ) === null, 'above-count orphan rows gone' );
+ok( meta_get( 'hero_banner_badges_0_badge_image' ) === '4419' && meta_get( 'hero_banner_badges' ) === '1', 'the surviving row is untouched' );
+
+echo "\n\033[1mscenario: the sweep never reaches a same-prefix sibling field\033[0m\n";
+$sibling = healthy_seed();
+$sibling['hero_banner_badges_2']              = '1';   // a repeater literally named "{name}_2"
+$sibling['hero_banner_badges_2_0_badge_image'] = '7777';
+meta_reset( $sibling, $CONTENT );
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'hero_banner_badges' => array( array( 'badge_image' => 4419 ) ) ),
+) ) );
+ok( meta_get( 'hero_banner_badges_2_0_badge_image' ) === '7777', "sibling field's rows survive the index-2 sweep" );
+ok( meta_get( 'hero_banner_badges_2' ) === '1', "sibling field's own count row survives" );
+
+echo "\n\033[1mscenario: clear_stale_rows=false leaves what ACF cannot clear\033[0m\n";
+meta_reset( $orphans, $CONTENT );
 $r = sitebridge_acf_fields_rest( req( array(
 	'post_id'          => 42,
 	'fields'           => array( 'hero_banner_badges' => array( array( 'badge_image' => 4419 ) ) ),
 	'clear_stale_rows' => false,
 ) ) );
-ok( ! is_wp_error( $r ) && $r['fields']['hero_banner_badges']['stale_rows_deleted'] === 0, 'nothing deleted' );
+ok( ! is_wp_error( $r ) && $r['fields']['hero_banner_badges']['stale_rows_deleted'] === 0, 'nothing swept' );
+ok( $r['fields']['hero_banner_badges']['stale_rows_found'] === 6, 'but the stranded rows are still reported' );
 ok( meta_get( 'hero_banner_badges' ) === '1', 'count row still governs (1)' );
-ok( meta_get( 'hero_banner_badges_1_badge_image' ) === '4225', 'old row 1 left behind, as ACF itself would' );
+ok( meta_get( 'hero_banner_badges_1_badge_link' ) === 'https://example.com/old', 'dead sub-field row left behind' );
+
+echo "\n\033[1mscenario: JSON null is normalized to ACF's empty value (v1.17.1)\033[0m\n";
+meta_reset( healthy_seed(), $CONTENT );
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'hero_banner_badges' => array( array( 'badge_image' => null ) ) ),
+) ) );
+ok( ! is_wp_error( $r ), 'write succeeds' );
+ok( meta_get( 'hero_banner_badges_0_badge_image' ) === '', "null sub-field value stored as '' , not skipped" );
+ok( meta_get( '_hero_banner_badges_0_badge_image' ) === 'field_61bce179a13a7', 'its reference row still holds the real sub key' );
+ok( $r['fields']['hero_banner_badges']['nulls_normalized'] === 1, 'response reports 1 null normalized' );
+ok( $r['fields']['hero_banner_badges']['state']['rows'][0]['badge_image']['reference_ok'] === true, 'state: the emptied row still resolves' );
+
+meta_reset( healthy_seed(), $CONTENT );
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'hero_banner_badges' => null, 'show_hero_banner' => null ),
+) ) );
+ok( meta_get( 'hero_banner_badges' ) === '0', 'a null repeater becomes an empty repeater, not a broken row' );
+ok( meta_get( 'hero_banner_badges_0_badge_image' ) === null, 'its rows are gone' );
+ok( meta_get( 'show_hero_banner' ) === '0' && meta_get( '_show_hero_banner' ) === 'field_61531e0536f8f', "a null scalar stores '' with an intact reference" );
+ok( $r['fields']['hero_banner_badges']['nulls_normalized'] === 1
+	&& $r['fields']['show_hero_banner']['nulls_normalized'] === 1, 'both nulls reported' );
 
 // ---------------------------------------------------------------- summary ---
 echo "\n$PASS passed, $FAIL failed\n";
