@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.17.1
+ * Version:     1.18.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.17.1' );
+define( 'SITEBRIDGE_VERSION', '1.18.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -2459,4 +2459,680 @@ function sitebridge_admin_redirects_page() {
 		<p class="description">These are also managed automatically by the AI connector (e.g. after a slug rename). Both edit the same list.</p>
 	</div>
 	<?php
+}
+
+/* ============================================================================
+ * CAPABILITY REPORT MODULE  (v1.18.0) — read-only site discovery
+ * ----------------------------------------------------------------------------
+ * One authenticated route, GET sitebridge/v1/capability-findings, that
+ * fingerprints the site and returns raw findings JSON. The plugin COLLECTS,
+ * NEVER JUDGES: all verdict logic lives in the wp-mcp-hosted connector, so it
+ * can evolve without a fleet release. The new `sitebridge/v1` namespace is for
+ * new surface only — the legacy `bam/*` namespaces stay untouched.
+ *
+ * Read-only guarantee: this module performs no update_*, insert, or transient calls
+ * and keeps no state between requests. A $wpdb 'query' monitor counts any
+ * write-verb SQL issued while collecting (third-party hooks firing during the
+ * wp_head buffer can write; ours never do) and the count ships in the payload
+ * as read_only_attestation. Rate limiting is deliberately OMITTED: a transient
+ * throttle would itself violate the zero-write guarantee, and the route is
+ * already admin-auth-gated.
+ *
+ * Every collector section runs in its own try/catch under a shared deadline;
+ * a failed section lands in collection_status.failed_sections and the run
+ * still returns — the connector renders those modules UNKNOWN, never guessed.
+ * ========================================================================== */
+
+const SITEBRIDGE_CAP_NS             = 'sitebridge/v1';
+const SITEBRIDGE_CAP_SCHEMA_VERSION = '1.0';
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( SITEBRIDGE_CAP_NS, '/capability-findings', array(
+		'methods'             => 'GET',
+		'callback'            => 'sitebridge_capability_findings_rest',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+	) );
+} );
+
+function sitebridge_capability_findings_rest( $req ) {
+	$deadline = microtime( true ) + 50; // < 60s budget, headroom for transport.
+
+	// -- write monitor (attestation, not enforcement) --------------------------
+	$writes  = array();
+	$monitor = function ( $query ) use ( &$writes ) {
+		if ( preg_match( '/^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP|TRUNCATE)\b/i', (string) $query ) ) {
+			$writes[] = substr( trim( (string) $query ), 0, 120 );
+		}
+		return $query;
+	};
+	add_filter( 'query', $monitor );
+
+	$status   = array( 'complete' => true, 'failed_sections' => array(), 'notes' => array() );
+	$findings = array(
+		'schema_version' => SITEBRIDGE_CAP_SCHEMA_VERSION,
+		'collected_at'   => gmdate( 'c' ),
+		'site'           => array( 'url' => home_url( '/' ) ),
+	);
+
+	$sections = array(
+		'environment'   => 'sitebridge_cap_environment',
+		'editor'        => 'sitebridge_cap_editor',
+		'plugins'       => 'sitebridge_cap_plugins',
+		'hosting'       => 'sitebridge_cap_hosting',
+		'nav'           => 'sitebridge_cap_nav',
+		'sitemap'       => 'sitebridge_cap_sitemap',
+		'content_model' => 'sitebridge_cap_content_model',
+		'schema_output' => 'sitebridge_cap_schema_output', // last: may self-fetch (network)
+	);
+	foreach ( $sections as $key => $fn ) {
+		if ( microtime( true ) > $deadline ) {
+			$status['complete']          = false;
+			$status['failed_sections'][] = $key;
+			$status['notes'][]           = $key . ': skipped — time budget exhausted';
+			continue;
+		}
+		try {
+			$findings[ $key ] = call_user_func( $fn, $deadline );
+		} catch ( Throwable $e ) {
+			$status['complete']          = false;
+			$status['failed_sections'][] = $key;
+			$status['notes'][]           = $key . ': ' . substr( $e->getMessage(), 0, 160 );
+		}
+	}
+
+	remove_filter( 'query', $monitor );
+	$findings['read_only_attestation'] = array(
+		'writes_performed' => count( $writes ),
+		'method'           => 'no update_*/insert/transient calls; $wpdb query monitor during collection',
+	);
+	if ( $writes ) {
+		// Not ours — the collector issues none — but worth surfacing: something
+		// else on this site writes during passive collection (heartbeat loggers,
+		// stat counters hooked to wp_head, …).
+		$status['notes'][] = 'write queries observed during collection (third-party hooks): '
+			. implode( ' | ', array_slice( $writes, 0, 3 ) );
+	}
+	$findings['collection_status'] = $status;
+
+	return rest_ensure_response( $findings );
+}
+
+/* ------------------------------------------------------------- environment -- */
+
+function sitebridge_cap_environment( $deadline ) {
+	$theme  = wp_get_theme();
+	$parent = $theme->parent();
+	return array(
+		'wp_version'   => get_bloginfo( 'version' ),
+		'php_version'  => phpversion(),
+		'https'        => ( strpos( home_url( '/' ), 'https://' ) === 0 ) || is_ssl(),
+		'multisite'    => is_multisite(),
+		'memory_limit' => defined( 'WP_MEMORY_LIMIT' ) ? WP_MEMORY_LIMIT : ini_get( 'memory_limit' ),
+		'theme'        => array(
+			'name'    => $theme->get( 'Name' ),
+			'version' => $theme->get( 'Version' ),
+			'parent'  => $parent ? $parent->get( 'Name' ) : null,
+		),
+	);
+}
+
+/* ------------------------------------------------------------------ editor -- */
+
+function sitebridge_cap_editor( $deadline ) {
+	$classic = sitebridge_cap_plugin_active( 'classic-editor' );
+	$block   = function_exists( 'use_block_editor_for_post_type' ) && use_block_editor_for_post_type( 'post' );
+	$default = 'block';
+	if ( $classic ) {
+		$default = ( get_option( 'classic-editor-replace', 'classic' ) === 'block' ) ? 'block' : 'classic';
+	} elseif ( ! $block ) {
+		$default = 'classic';
+	}
+	return array(
+		'gutenberg_available'   => $block,
+		'classic_editor_plugin' => $classic,
+		'default_editor'        => $default,
+	);
+}
+
+/* ----------------------------------------------------------------- plugins -- */
+
+// Active plugins as [ [slug, file, name, version], … ] — slug is the directory
+// (or basename for single-file plugins), headers read straight from the file.
+function sitebridge_cap_active_plugins() {
+	static $list = null;
+	if ( $list !== null ) {
+		return $list;
+	}
+	$list   = array();
+	$active = (array) get_option( 'active_plugins', array() );
+	foreach ( $active as $file ) {
+		$slug = ( strpos( $file, '/' ) !== false ) ? dirname( $file ) : basename( $file, '.php' );
+		$row  = array( 'slug' => $slug, 'file' => $file, 'name' => $slug, 'version' => '' );
+		$path = WP_PLUGIN_DIR . '/' . $file;
+		if ( function_exists( 'get_file_data' ) && is_readable( $path ) ) {
+			$head = get_file_data( $path, array( 'Name' => 'Plugin Name', 'Version' => 'Version' ) );
+			if ( ! empty( $head['Name'] ) )    { $row['name'] = $head['Name']; }
+			if ( ! empty( $head['Version'] ) ) { $row['version'] = $head['Version']; }
+		}
+		$list[] = $row;
+	}
+	return $list;
+}
+
+function sitebridge_cap_plugin_active( $slug ) {
+	foreach ( sitebridge_cap_active_plugins() as $p ) {
+		if ( $p['slug'] === $slug ) {
+			return $p;
+		}
+	}
+	return false;
+}
+
+function sitebridge_cap_plugins( $deadline ) {
+	global $wpdb;
+	$active = sitebridge_cap_active_plugins();
+
+	$first_match = function ( $map ) use ( $active ) {
+		foreach ( $active as $p ) {
+			if ( isset( $map[ $p['slug'] ] ) ) {
+				return array( $map[ $p['slug'] ], $p );
+			}
+		}
+		return array( null, null );
+	};
+	$all_matches = function ( $map ) use ( $active ) {
+		$out = array();
+		foreach ( $active as $p ) {
+			if ( isset( $map[ $p['slug'] ] ) && ! in_array( $map[ $p['slug'] ], $out, true ) ) {
+				$out[] = $map[ $p['slug'] ];
+			}
+		}
+		return $out ? $out : array( 'none' );
+	};
+
+	list( $seo, $seo_p ) = $first_match( array(
+		'wordpress-seo' => 'yoast', 'wordpress-seo-premium' => 'yoast',
+		'seo-by-rank-math' => 'rankmath', 'all-in-one-seo-pack' => 'aioseo',
+		'aioseo-pro' => 'aioseo', 'wp-seopress' => 'seopress', 'wp-seopress-pro' => 'seopress',
+	) );
+
+	$builder_map = array(
+		'elementor' => 'elementor', 'elementor-pro' => 'elementor',
+		'divi-builder' => 'divi', 'js_composer' => 'wpbakery',
+		'beaver-builder-lite-version' => 'beaver', 'bb-plugin' => 'beaver',
+	);
+	$builders = $all_matches( $builder_map );
+	$theme    = wp_get_theme();
+	if ( in_array( strtolower( (string) $theme->get_template() ), array( 'divi', 'extra' ), true )
+		&& ! in_array( 'divi', $builders, true ) ) {
+		$builders   = array_diff( $builders, array( 'none' ) );
+		$builders[] = 'divi';
+		$builders   = array_values( $builders );
+	}
+
+	// --- redirects: SiteBridge first, then known plugins, then suspects -------
+	$sb_rules  = get_option( SITEBRIDGE_REDIRECTS_OPTION, array() );
+	$handler   = 'none_detected';
+	$rules     = 0;
+	$handled_slug = null;
+	if ( is_array( $sb_rules ) && count( $sb_rules ) > 0 ) {
+		$handler = 'sitebridge';
+		$rules   = count( $sb_rules );
+	} elseif ( sitebridge_cap_plugin_active( 'redirection' ) ) {
+		$handler      = 'redirection';
+		$handled_slug = 'redirection';
+		$table        = $wpdb->prefix . 'redirection_items';
+		$exists       = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+		$rules        = $exists ? (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$table}`" ) : 0;
+	} elseif ( sitebridge_cap_plugin_active( 'wordpress-seo-premium' ) ) {
+		$handler      = 'yoast_premium';
+		$handled_slug = 'wordpress-seo-premium';
+		$yr           = get_option( 'wpseo-premium-redirects-base', array() );
+		$rules        = is_array( $yr ) ? count( $yr ) : 0;
+	} elseif ( sitebridge_cap_plugin_active( 'safe-redirect-manager' ) ) {
+		$handler      = 'safe_redirect';
+		$handled_slug = 'safe-redirect-manager';
+		$counts       = wp_count_posts( 'redirect_rule' );
+		$rules        = isset( $counts->publish ) ? (int) $counts->publish : 0;
+	}
+
+	// Suspect scan: redirect-ish slugs/names not already classified. A hidden
+	// redirect plugin is a proven fleet failure mode — an unknown handler must
+	// surface here, never collapse into none_detected.
+	$suspects = array();
+	foreach ( $active as $p ) {
+		if ( $p['slug'] === $handled_slug || $p['slug'] === 'sitebridge-ai' ) {
+			continue;
+		}
+		$why = '';
+		if ( preg_match( '/redirect|301|url.?rewrit/i', $p['slug'] ) ) {
+			$why = 'slug matches redirect pattern';
+		} elseif ( preg_match( '/redirect|301|url.?rewrit/i', $p['name'] ) ) {
+			$why = 'name matches redirect pattern';
+		}
+		if ( $why ) {
+			$suspects[] = array( 'slug' => $p['slug'], 'name' => $p['name'], 'match_reason' => $why );
+		}
+	}
+
+	// --- ACF ------------------------------------------------------------------
+	$acf = array( 'present' => false, 'version' => '', 'pro' => false, 'field_group_count' => 0, 'local_json' => false );
+	if ( function_exists( 'acf_get_field_groups' ) ) {
+		$acf['present'] = true;
+		$acf['version'] = defined( 'ACF_VERSION' ) ? ACF_VERSION : '';
+		$acf['pro']     = class_exists( 'acf_pro' ) || defined( 'ACF_PRO' );
+		$groups         = (array) acf_get_field_groups();
+		$acf['field_group_count'] = count( $groups );
+		if ( function_exists( 'acf_get_setting' ) ) {
+			$json = acf_get_setting( 'load_json' );
+			$acf['local_json'] = is_array( $json ) && count( array_filter( (array) $json, function ( $d ) {
+				return is_string( $d ) && is_dir( $d ) && glob( trailingslashit( $d ) . '*.json' );
+			} ) ) > 0;
+		}
+	}
+
+	return array(
+		'active'     => array_map( function ( $p ) {
+			return array( 'slug' => $p['slug'], 'name' => $p['name'], 'version' => $p['version'] );
+		}, $active ),
+		'sitebridge' => array( 'present' => true, 'version' => SITEBRIDGE_VERSION ),
+		'seo'        => array( 'detected' => $seo ? $seo : 'none', 'version' => $seo_p ? $seo_p['version'] : '' ),
+		'acf'        => $acf,
+		'builders'   => $builders,
+		'redirects'  => array(
+			'handler'                     => $handler,
+			'rule_count'                  => $rules,
+			'suspect_plugins'             => $suspects,
+			'host_level_rules_detectable' => false, // WPE/Kinsta portal rules are edge-evaluated — invisible from WP.
+		),
+		'cache'        => $all_matches( array(
+			'nitropack' => 'nitropack', 'wp-rocket' => 'wprocket', 'w3-total-cache' => 'w3tc',
+			'cloudflare' => 'cloudflare_plugin', 'wp-super-cache' => 'wpsupercache',
+			'litespeed-cache' => 'litespeed', 'sg-cachepress' => 'sg_optimizer', 'breeze' => 'breeze',
+		) ),
+		'security'     => $all_matches( array(
+			'wordfence' => 'wordfence', 'better-wp-security' => 'ithemes', 'sucuri-scanner' => 'sucuri',
+		) ),
+		'multilingual' => $all_matches( array(
+			'sitepress-multilingual-cms' => 'wpml', 'polylang' => 'polylang', 'polylang-pro' => 'polylang',
+		) ),
+	);
+}
+
+/* ----------------------------------------------------------------- hosting -- */
+
+function sitebridge_cap_hosting( $deadline ) {
+	$signals = array();
+	$mu      = defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : ( WP_CONTENT_DIR . '/mu-plugins' );
+	if ( defined( 'WPE_APIKEY' ) || function_exists( 'wpe_param' ) )      { $signals['wpengine'][] = 'WPE constant/function'; }
+	if ( is_dir( $mu . '/wpengine-common' ) )                             { $signals['wpengine'][] = 'mu-plugin: wpengine-common'; }
+	if ( defined( 'KINSTAMU_VERSION' ) )                                  { $signals['kinsta'][] = 'KINSTAMU_VERSION'; }
+	if ( is_dir( $mu . '/kinsta-mu-plugins' ) )                           { $signals['kinsta'][] = 'mu-plugin: kinsta-mu-plugins'; }
+	if ( defined( 'FLYWHEEL_CONFIG_DIR' ) || defined( 'FLYWHEEL_PLUGIN_DIR' ) ) { $signals['flywheel'][] = 'FLYWHEEL constant'; }
+	if ( is_dir( WP_CONTENT_DIR . '/.fw-config' ) )                       { $signals['flywheel'][] = 'dropin: .fw-config'; }
+
+	$provider = 'unknown';
+	$flat     = array();
+	foreach ( $signals as $host => $sigs ) {
+		if ( $provider === 'unknown' ) {
+			$provider = $host;
+		}
+		foreach ( $sigs as $s ) {
+			$flat[] = $host . ': ' . $s;
+		}
+	}
+	return array( 'provider_detected' => $provider, 'signals' => $flat );
+}
+
+/* ---------------------------------------------------- ACF field-type maps  -- */
+
+// Walk registered field groups once and map field NAME → type, split into
+// simple content types (wysiwyg/textarea) and complex structures
+// (repeater/flexible_content/group). Local-JSON groups register on init, so
+// this sees them. NEVER uses get_field() — value retrieval runs theme filters
+// that can fatal (culligan-v4's decrypt filter is the proven case).
+function sitebridge_cap_acf_field_maps() {
+	static $maps = null;
+	if ( $maps !== null ) {
+		return $maps;
+	}
+	$maps = array( 'simple' => array(), 'complex' => array(), 'groups' => array() );
+	if ( ! function_exists( 'acf_get_field_groups' ) || ! function_exists( 'acf_get_fields' ) ) {
+		return $maps;
+	}
+	$walk = function ( $fields ) use ( &$walk, &$maps ) {
+		foreach ( (array) $fields as $f ) {
+			if ( empty( $f['name'] ) || empty( $f['type'] ) ) {
+				continue;
+			}
+			if ( in_array( $f['type'], array( 'wysiwyg', 'textarea' ), true ) ) {
+				$maps['simple'][ $f['name'] ] = $f['type'];
+			} elseif ( in_array( $f['type'], array( 'repeater', 'flexible_content', 'group' ), true ) ) {
+				$maps['complex'][ $f['name'] ] = $f['type'];
+			}
+			if ( ! empty( $f['sub_fields'] ) ) {
+				$walk( $f['sub_fields'] );
+			}
+			if ( ! empty( $f['layouts'] ) ) {
+				foreach ( (array) $f['layouts'] as $layout ) {
+					if ( ! empty( $layout['sub_fields'] ) ) {
+						$walk( $layout['sub_fields'] );
+					}
+				}
+			}
+		}
+	};
+	foreach ( (array) acf_get_field_groups() as $g ) {
+		$fields = (array) acf_get_fields( $g );
+		$walk( $fields );
+		$types = array();
+		$scan  = function ( $fs ) use ( &$scan, &$types ) {
+			foreach ( (array) $fs as $f ) {
+				if ( ! empty( $f['type'] ) && in_array( $f['type'], array( 'wysiwyg', 'textarea', 'flexible_content', 'repeater' ), true )
+					&& ! in_array( $f['type'], $types, true ) ) {
+					$types[] = $f['type'];
+				}
+				if ( ! empty( $f['sub_fields'] ) ) { $scan( $f['sub_fields'] ); }
+			}
+		};
+		$scan( $fields );
+		$loc = array();
+		foreach ( (array) ( isset( $g['location'] ) ? $g['location'] : array() ) as $rule_group ) {
+			$parts = array();
+			foreach ( (array) $rule_group as $rule ) {
+				if ( isset( $rule['param'], $rule['operator'], $rule['value'] ) ) {
+					$parts[] = $rule['param'] . ' ' . $rule['operator'] . ' ' . $rule['value'];
+				}
+			}
+			if ( $parts ) { $loc[] = implode( ' AND ', $parts ); }
+		}
+		$maps['groups'][] = array(
+			'key'                    => isset( $g['key'] ) ? $g['key'] : '',
+			'title'                  => isset( $g['title'] ) ? $g['title'] : '',
+			'location_rules_summary' => implode( ' OR ', $loc ),
+			'content_field_types'    => $types,
+			'_location_raw'          => isset( $g['location'] ) ? $g['location'] : array(),
+		);
+	}
+	return $maps;
+}
+
+/* ----------------------------------------------------------- content model -- */
+
+function sitebridge_cap_content_model( $deadline ) {
+	global $wpdb;
+	$maps  = sitebridge_cap_acf_field_maps();
+	$types = get_post_types( array( 'public' => true ), 'objects' );
+	unset( $types['attachment'] );
+
+	$out_types = array();
+	foreach ( $types as $t ) {
+		if ( microtime( true ) > $deadline ) {
+			break;
+		}
+		$counts  = wp_count_posts( $t->name );
+		$count   = isset( $counts->publish ) ? (int) $counts->publish : 0;
+		$ids     = get_posts( array(
+			'post_type'      => $t->name,
+			'post_status'    => 'publish',
+			'numberposts'    => 25,
+			'fields'         => 'ids',
+			'orderby'        => 'date',
+			'order'          => 'DESC',
+		) );
+		$votes   = array( 'post_content' => 0, 'acf_simple' => 0, 'acf_complex' => 0, 'mixed' => 0, 'builder' => 0, 'empty' => 0 );
+		$complex_seen = array();
+		foreach ( $ids as $id ) {
+			$post    = get_post( $id );
+			$content = $post ? trim( (string) $post->post_content ) : '';
+			$meta    = (array) get_post_meta( $id );
+
+			$has_builder = (bool) preg_match( '/\[et_pb_|\[vc_row|<!-- wp:elementor|<!-- wp:divi/', $content )
+				|| ( isset( $meta['_elementor_data'][0] ) && strlen( (string) $meta['_elementor_data'][0] ) > 10 );
+
+			$has_simple  = false;
+			foreach ( $maps['simple'] as $name => $type ) {
+				if ( ! empty( $meta[ $name ][0] ) ) { $has_simple = true; break; }
+			}
+			$has_complex = false;
+			foreach ( $maps['complex'] as $name => $type ) {
+				// Repeater/flexible storage: the value row is the row COUNT (or
+				// layout list); non-empty / >0 means real rows exist.
+				if ( isset( $meta[ $name ][0] ) && $meta[ $name ][0] !== '' && $meta[ $name ][0] !== '0' ) {
+					$has_complex = true;
+					if ( ! in_array( $maps['complex'][ $name ], $complex_seen, true ) ) {
+						$complex_seen[] = $maps['complex'][ $name ];
+					}
+				}
+			}
+
+			$len = strlen( $content );
+			if ( $has_builder ) {
+				$votes['builder']++;
+			} elseif ( $len > 200 && ( $has_simple || $has_complex ) ) {
+				$votes['mixed']++;
+			} elseif ( $has_complex ) {
+				$votes['acf_complex']++;
+			} elseif ( $has_simple ) {
+				$votes['acf_simple']++;
+			} elseif ( $len > 0 ) {
+				$votes['post_content']++;
+			} else {
+				$votes['empty']++;
+			}
+		}
+		$sampled = count( $ids );
+		arsort( $votes );
+		reset( $votes );
+		$label      = $sampled ? key( $votes ) : 'empty';
+		$confidence = $sampled ? round( $votes[ $label ] / $sampled, 2 ) : 0.0;
+
+		$out_types[] = array(
+			'name'                   => $t->name,
+			'rest_base'              => ! empty( $t->rest_base ) ? $t->rest_base : $t->name,
+			'label'                  => $t->label,
+			'public'                 => true,
+			'count'                  => $count,
+			'body_storage'           => $label,
+			'acf_complex_types_seen' => $complex_seen,
+			'storage_confidence'     => $confidence,
+			'sample_size'            => $sampled,
+		);
+	}
+
+	// Published pages with zero-length content — proven to masquerade as a
+	// homepage redirect (reads as a mystery 301 in crawls).
+	$empty_count = (int) $wpdb->get_var(
+		"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'page' AND post_status = 'publish' AND TRIM(post_content) = ''"
+	);
+	$empty_ids = array_map( 'intval', (array) $wpdb->get_col(
+		"SELECT ID FROM {$wpdb->posts} WHERE post_type = 'page' AND post_status = 'publish' AND TRIM(post_content) = '' ORDER BY ID ASC LIMIT 10"
+	) );
+
+	// Any ACF block JSON in sampled content? (search_replace escaped-quote trap)
+	$acf_block = (bool) $wpdb->get_var(
+		"SELECT ID FROM {$wpdb->posts} WHERE post_status = 'publish' AND post_content LIKE '%<!-- wp:acf/%' LIMIT 1"
+	);
+
+	$groups = array();
+	foreach ( $maps['groups'] as $g ) {
+		unset( $g['_location_raw'] );
+		$groups[] = $g;
+	}
+
+	return array(
+		'post_type_naming'      => array( 'slug_convention' => 'post_type_name', 'also_emitted' => 'rest_base' ),
+		'post_types'            => $out_types,
+		'empty_published_pages' => array( 'count' => $empty_count, 'sample_ids' => $empty_ids ),
+		'acf_block_json_present' => $acf_block,
+		'acf_field_groups'      => $groups,
+	);
+}
+
+/* ----------------------------------------------------------- schema output -- */
+
+function sitebridge_cap_parse_jsonld( $html ) {
+	$blocks = array();
+	if ( preg_match_all( '#<script\b[^>]*type\s*=\s*["\']application/ld\+json["\'][^>]*>(.*?)</script>#is', (string) $html, $m, PREG_SET_ORDER ) ) {
+		foreach ( $m as $hit ) {
+			$blocks[] = array( 'tag' => $hit[0], 'json' => trim( $hit[1] ) );
+		}
+	}
+	return $blocks;
+}
+
+function sitebridge_cap_schema_output( $deadline ) {
+	// Primary: output-buffer wp_head in a controlled context — immune to
+	// page-cache rewrites (cached HTML can move/rewrite inline JSON-LD).
+	$html   = '';
+	$method = 'output_buffer';
+	$level  = ob_get_level();
+	try {
+		ob_start();
+		do_action( 'wp_head' );
+		$html = (string) ob_get_clean();
+	} catch ( Throwable $e ) {
+		$html = '';
+	}
+	// Drop only buffers we opened; pre-existing ones stay.
+	while ( ob_get_level() > $level ) {
+		ob_end_clean();
+	}
+	$blocks = sitebridge_cap_parse_jsonld( $html );
+
+	// Zero blocks from the buffer is ambiguous — either the site truly emits
+	// none, or emitters bailed outside a real front-end query. The cache-busted
+	// self-fetch settles it.
+	if ( ! $blocks ) {
+		$url  = add_query_arg( 'sb_cap_nocache', (string) time(), home_url( '/' ) );
+		$resp = wp_remote_get( $url, array(
+			'timeout'   => 10,
+			'headers'   => array( 'Cache-Control' => 'no-cache', 'Pragma' => 'no-cache', 'User-Agent' => 'SiteBridge-Capability/1.0' ),
+			'sslverify' => true,
+		) );
+		if ( ! is_wp_error( $resp ) && wp_remote_retrieve_response_code( $resp ) === 200 ) {
+			$body   = wp_remote_retrieve_body( $resp );
+			$head   = ( preg_match( '#^(.*?)</head>#is', $body, $hm ) ) ? $hm[1] : $body;
+			$blocks = sitebridge_cap_parse_jsonld( $head );
+			$html   = $head;
+			$method = 'self_fetch_cachebusted';
+		}
+	}
+
+	$emitters = array();
+	$sb_found = ( strpos( $html, 'sitebridge-schema' ) !== false ) || ( strpos( $html, 'bam-schema' ) !== false );
+	if ( $sb_found ) { $emitters[] = 'sitebridge'; }
+	if ( strpos( $html, 'yoast-schema-graph' ) !== false )        { $emitters[] = 'yoast'; }
+	if ( stripos( $html, 'saswp' ) !== false )                    { $emitters[] = 'saswp'; }
+	if ( preg_match( '/schema[-_ ]?pro/i', $html ) )              { $emitters[] = 'schema_pro'; }
+	// Blocks not attributable to a known emitter = theme/inline.
+	$attributed = 0;
+	foreach ( $blocks as $b ) {
+		if ( strpos( $b['tag'], 'sitebridge-schema' ) !== false || strpos( $b['tag'], 'bam-schema' ) !== false
+			|| strpos( $b['tag'], 'yoast-schema-graph' ) !== false || stripos( $b['tag'], 'saswp' ) !== false ) {
+			$attributed++;
+		}
+	}
+	if ( count( $blocks ) > $attributed ) { $emitters[] = 'theme_inline'; }
+	if ( ! $emitters ) { $emitters[] = 'none'; }
+
+	$types = array();
+	foreach ( $blocks as $b ) {
+		$data = json_decode( $b['json'], true );
+		if ( ! is_array( $data ) ) { continue; }
+		$nodes = isset( $data['@graph'] ) && is_array( $data['@graph'] ) ? $data['@graph'] : array( $data );
+		foreach ( $nodes as $node ) {
+			if ( ! is_array( $node ) || ! isset( $node['@type'] ) ) { continue; }
+			foreach ( (array) $node['@type'] as $tn ) {
+				if ( is_string( $tn ) && ! in_array( $tn, $types, true ) && count( $types ) < 20 ) {
+					$types[] = $tn;
+				}
+			}
+		}
+	}
+
+	return array(
+		'emitters_detected'         => $emitters,
+		'sitebridge_signature_found' => $sb_found,
+		'head_jsonld_block_count'   => count( $blocks ),
+		'types_seen'                => $types,
+		'fetch_method'              => $method,
+	);
+}
+
+/* --------------------------------------------------------------------- nav -- */
+
+function sitebridge_cap_nav( $deadline ) {
+	global $wpdb;
+	$mechanisms = array();
+	$menus      = function_exists( 'wp_get_nav_menus' ) ? (array) wp_get_nav_menus() : array();
+	if ( count( $menus ) > 0 ) {
+		$mechanisms[] = 'wp_menus';
+	}
+
+	// Generic ACF options-page nav: a field group located on an options page
+	// with a repeater/group/flexible field named like nav/menu — confirmed by
+	// raw options rows (existence only; never get_field()). The Culligan
+	// mega-menu (main_nav_settings_version_2) is one instance of this.
+	$acf_nav = false;
+	$maps    = sitebridge_cap_acf_field_maps();
+	foreach ( $maps['groups'] as $g ) {
+		$on_options = false;
+		foreach ( (array) $g['_location_raw'] as $rule_group ) {
+			foreach ( (array) $rule_group as $rule ) {
+				if ( isset( $rule['param'] ) && $rule['param'] === 'options_page' ) {
+					$on_options = true;
+				}
+			}
+		}
+		if ( ! $on_options ) { continue; }
+		foreach ( $maps['complex'] as $name => $type ) {
+			if ( preg_match( '/nav|menu/i', $name ) ) {
+				$row = $wpdb->get_var( $wpdb->prepare(
+					"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s LIMIT 1",
+					'options_' . $wpdb->esc_like( $name ) . '%'
+				) );
+				if ( $row ) { $acf_nav = true; break 2; }
+			}
+		}
+	}
+	// Data probe even when groups aren't discoverable in this context.
+	if ( ! $acf_nav ) {
+		$row = $wpdb->get_var(
+			"SELECT option_name FROM {$wpdb->options}
+			 WHERE ( option_name LIKE 'options\\_%nav%' OR option_name LIKE 'options\\_%menu%' )
+			 LIMIT 1"
+		);
+		if ( $row ) { $acf_nav = true; }
+	}
+	if ( $acf_nav ) {
+		$mechanisms[] = 'acf_options_nav';
+	}
+
+	// Builder-managed nav: a builder is active and neither classic menus nor
+	// ACF nav data exist.
+	if ( ! $mechanisms ) {
+		foreach ( sitebridge_cap_active_plugins() as $p ) {
+			if ( preg_match( '/elementor|divi|js_composer|beaver|bb-plugin/', $p['slug'] ) ) {
+				$mechanisms[] = 'builder';
+				break;
+			}
+		}
+	}
+
+	return array( 'mechanisms' => $mechanisms, 'menu_count' => count( $menus ) );
+}
+
+/* ----------------------------------------------------------------- sitemap -- */
+
+function sitebridge_cap_sitemap( $deadline ) {
+	if ( defined( 'WPSEO_VERSION' ) ) {
+		$opt     = get_option( 'wpseo', array() );
+		$enabled = ! is_array( $opt ) || ! isset( $opt['enable_xml_sitemap'] ) || $opt['enable_xml_sitemap'];
+		return array( 'present' => (bool) $enabled, 'source' => 'yoast' );
+	}
+	if ( function_exists( 'wp_sitemaps_get_server' ) ) {
+		return array( 'present' => (bool) apply_filters( 'wp_sitemaps_enabled', true ), 'source' => 'core' );
+	}
+	return array( 'present' => false, 'source' => 'other' );
 }
