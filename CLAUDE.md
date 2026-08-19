@@ -1,10 +1,10 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.17.1**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.18.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
-writes**. Self-updates from GitHub releases. Host- and site-agnostic by design.
+writes**, **read-only capability findings** (site viability discovery). Self-updates from GitHub releases. Host- and site-agnostic by design.
 
 ## Where this sits (3 layers — don't conflate them)
 
@@ -30,7 +30,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.17.1)
+## REST surface (v1.18.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -120,6 +120,19 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   (or plugin-installed-but-not-connected) `nitropack` appears in `detected` but not `fired`, and
   the `note` says so. Its per-URL purge is real (local drop-in + remote), so no `partial` there.
 
+- **Capability findings** (v1.18+): `GET sitebridge/v1/capability-findings` — the one route on the
+  NEW `sitebridge/v1` namespace (new surface only; `bam/*` stays legacy-frozen). Read-only site
+  fingerprint for the connector's `capability_report` tool: environment, hosting signatures,
+  plugin inventory (SEO/ACF/builders/cache/security/multilingual), redirect handler + hidden-
+  redirect-plugin suspect scan, content-storage classification (raw `get_post_meta()` only — the
+  collector NEVER calls `get_field()`, theme value-filters can fatal), empty published pages,
+  schema emitters (output-buffer `wp_head` primary, cache-busted self-fetch fallback), nav
+  mechanisms, sitemap. The plugin collects, never judges — verdicts live in the connector's
+  rulebook. Provably read-only: zero writes/transients, per-request `$wpdb` query monitor ships a
+  write count as `read_only_attestation`; rate limiting deliberately omitted (a transient
+  throttle would itself write). Sections run in individual try/catch under a 50s deadline —
+  failures land in `collection_status.failed_sections`, the run still returns.
+
 Site-/theme-specific tailoring is centralized in the **CONFIG/PROFILE** block at the top of the
 file, overridable via `wp-config` constants / filters. Keep new tailoring there, not scattered
 through the code.
@@ -147,6 +160,12 @@ false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 `function_exists()`/`defined()` state (present/connected, disconnected, API-throws, legacy
 `nitropack_purge()`, absent). The absent scenario doubles as the no-behavior-change check for
 non-NitroPack hosts (WP Engine sites must return byte-identical purge responses).
+
+`php tests/capability-acceptance.php` — 96 assertions over the capability-findings route, five
+subprocess scenarios (culligan-shaped, no-ACF, builder, schema-fetch fallback, section failure).
+Every scenario asserts read-only at the SQL/options layer and that `get_field()` is never called.
+Its live assumptions (real query log shows zero writes; Dallas/San Diego pre-audit diffs) are the
+release acceptance pass.
 
 ## Self-updater
 
