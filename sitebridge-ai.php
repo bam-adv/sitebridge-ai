@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.17.0
+ * Version:     1.17.1
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.17.0' );
+define( 'SITEBRIDGE_VERSION', '1.17.1' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -1795,6 +1795,13 @@ function sitebridge_build_url( $p ) {
  *
  * Partial update is guaranteed by construction: the loop only ever calls
  * update_field() for selectors present in `fields`.
+ *
+ * NULL VALUES (v1.17.1): JSON `null` is not something ACF can store. Passing it
+ * for an empty image sub-field leaves a value/reference row pair the front end
+ * resolves to nothing — the broken row observed during the Aug 2026 hero
+ * rollout. The storable "no value" is `""`, so nulls anywhere in `fields` are
+ * normalized to `""` before any write (a null repeater/group/flexible value
+ * becomes `[]`), and the count is reported per field as `nulls_normalized`.
  * ========================================================================== */
 
 add_action( 'rest_api_init', function () {
@@ -1855,7 +1862,17 @@ function sitebridge_acf_fields_rest( WP_REST_Request $req ) {
 				array( 'status' => 409 )
 			);
 		}
-		$resolved[] = array( 'field' => $field, 'value' => $value );
+		// JSON null is not storable — normalize it to ACF's empty value before it
+		// can write a reference row the front end resolves to nothing.
+		$nulls = 0;
+		if ( $value === null && in_array( $field['type'], array( 'repeater', 'flexible_content', 'group' ), true ) ) {
+			$value = array();
+			$nulls = 1;
+		} else {
+			$value = sitebridge_acf_normalize_nulls( $value, $nulls );
+		}
+
+		$resolved[] = array( 'field' => $field, 'value' => $value, 'nulls' => $nulls );
 	}
 
 	// Hero exclusivity guard (theme profile, see CONFIG): a page that renders the
@@ -1879,35 +1896,36 @@ function sitebridge_acf_fields_rest( WP_REST_Request $req ) {
 		$field = $r['field'];
 		$name  = $field['name'];
 
-		$stale_deleted = 0;
-		$before_count  = ( $field['type'] === 'repeater' ) ? (int) get_post_meta( $post_id, $name, true ) : null;
+		$is_repeater = ( $field['type'] === 'repeater' && is_array( $r['value'] ) );
+		$after_count = $is_repeater ? count( $r['value'] ) : 0;
+
+		// Rows above the incoming row count, measured BEFORE the write: what this
+		// shrink actually strands, whoever ends up clearing it.
+		$stale_found = $is_repeater
+			? count( sitebridge_acf_repeater_rows_from( $post_id, $name, $after_count ) )
+			: 0;
 
 		// The write. Return value is NOT the verification (update_metadata()
 		// returns false on an unchanged value) — the read-back below is.
 		update_field( $field['key'], $r['value'], $post_id );
 
-		// A shrinking repeater leaves its old higher-index rows behind. ACF
-		// ignores them (the count row governs) but they accumulate — clear them.
-		if ( $clear_stale && $field['type'] === 'repeater' && is_array( $r['value'] ) ) {
-			$after_count = count( $r['value'] );
-			if ( $before_count !== null && $after_count < $before_count ) {
-				foreach ( array( '', '_' ) as $prefix ) {
-					for ( $i = $after_count; $i < $before_count; $i++ ) {
-						$like = $wpdb->esc_like( $prefix . $name . '_' . $i . '_' ) . '%';
-						$stale_deleted += (int) $wpdb->query( $wpdb->prepare(
-							"DELETE FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key LIKE %s",
-							$post_id,
-							$like
-						) );
-					}
-				}
-			}
-		}
+		// A shrinking repeater leaves its old higher-index rows behind. ACF's own
+		// repeater update_value() already deletes the rows of sub-fields still in
+		// the group schema, so this sweep normally finds nothing to do — which is
+		// why `stale_rows_deleted` is legitimately 0 on a clean shrink and
+		// `stale_rows_found` is the number a caller is actually asking for. What
+		// the sweep does catch is what ACF cannot know about: rows of sub-fields
+		// since removed from the group, and rows orphaned above a stale count row.
+		$stale_delete = ( $clear_stale && $is_repeater )
+			? sitebridge_acf_repeater_rows_from( $post_id, $name, $after_count )
+			: array();
 
 		$results[ $name ] = array(
 			'field_key'          => $field['key'],
 			'type'               => $field['type'],
-			'stale_rows_deleted' => $stale_deleted,
+			'stale_rows_found'   => $stale_found,
+			'stale_rows_deleted' => $stale_delete ? sitebridge_acf_delete_meta_keys( $post_id, $stale_delete ) : 0,
+			'nulls_normalized'   => (int) $r['nulls'],
 		);
 	}
 
@@ -1934,6 +1952,79 @@ function sitebridge_acf_fields_rest( WP_REST_Request $req ) {
 		'content_md5_after'   => $md5_after,
 		'content_untouched'   => ( $md5_before === $md5_after ),
 	);
+}
+
+/**
+ * Recursively replace JSON `null` with ACF's storable empty value (`""`),
+ * counting the substitutions. `null` reaches update_field() as "no value" but
+ * ACF still writes the field's reference row, leaving a pair the front end
+ * resolves to nothing; `""` is what an admin save stores for an emptied field.
+ */
+function sitebridge_acf_normalize_nulls( $value, &$count ) {
+	if ( $value === null ) {
+		$count++;
+		return '';
+	}
+	if ( is_array( $value ) ) {
+		foreach ( $value as $k => $v ) {
+			$value[ $k ] = sitebridge_acf_normalize_nulls( $v, $count );
+		}
+	}
+	return $value;
+}
+
+/**
+ * Every postmeta key belonging to repeater {$name} at a row index >= $min_index,
+ * value rows and their "_" references alike.
+ *
+ * Two guards keep a neighbouring field's rows out of the result: matching is
+ * anchored on the digits that must follow the repeater name (so "{$name}_extra_…"
+ * never matches at all), and an index whose "{$name}_{i}" prefix is itself a
+ * registered field is skipped entirely — those rows are that field's, not row i
+ * of this one. Anything else at or above the index is fair game, including rows
+ * of sub-fields no longer in the group.
+ */
+function sitebridge_acf_repeater_rows_from( $post_id, $name, $min_index ) {
+	global $wpdb;
+
+	$rows = $wpdb->get_results( $wpdb->prepare(
+		"SELECT meta_id, meta_key, meta_value FROM {$wpdb->postmeta}
+		 WHERE post_id = %d AND ( meta_key LIKE %s OR meta_key LIKE %s )",
+		$post_id,
+		$wpdb->esc_like( $name . '_' ) . '%',
+		$wpdb->esc_like( '_' . $name . '_' ) . '%'
+	) );
+
+	$keys       = array();
+	$regex      = '/^_?' . preg_quote( $name, '/' ) . '_(\d+)_/';
+	$is_sibling = array();
+	foreach ( (array) $rows as $row ) {
+		if ( ! preg_match( $regex, $row->meta_key, $m ) || (int) $m[1] < $min_index ) {
+			continue;
+		}
+		$i = (int) $m[1];
+		if ( ! isset( $is_sibling[ $i ] ) ) {
+			$is_sibling[ $i ] = (bool) acf_get_field( $name . '_' . $i );
+		}
+		if ( ! $is_sibling[ $i ] ) {
+			$keys[] = $row->meta_key;
+		}
+	}
+	return $keys;
+}
+
+/** Delete the named postmeta keys off one post; returns the row count deleted. */
+function sitebridge_acf_delete_meta_keys( $post_id, array $keys ) {
+	global $wpdb;
+
+	if ( empty( $keys ) ) {
+		return 0;
+	}
+	$placeholders = implode( ', ', array_fill( 0, count( $keys ), '%s' ) );
+	return (int) $wpdb->query( $wpdb->prepare(
+		"DELETE FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key IN ( $placeholders )",
+		array_merge( array( $post_id ), array_values( $keys ) )
+	) );
 }
 
 /**
