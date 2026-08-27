@@ -4,7 +4,7 @@
  *
  * No WordPress, no PHPUnit, no network: stubs just enough WP/ACF to load
  * sitebridge-ai.php and drive the nav REST callbacks directly against an
- * in-memory ACF option seeded with a Culligan-shaped 8-item nav.
+ * in-memory ACF option seeded with a Profile-A-shaped 8-item nav.
  *
  * Run:  php tests/nav-acceptance.php     (exit 0 = all assertions passed)
  *
@@ -106,7 +106,7 @@ function ok( $cond, $label ) {
 function section( $t ) { echo "\n\033[1m$t\033[0m\n"; }
 function req( $params ) { return new WP_REST_Request( $params ); }
 
-/** A Culligan-shaped nav: 8 top-level items, one with a fat mega-menu. */
+/** A Profile-A-shaped nav: 8 top-level items, one with a fat mega-menu. */
 function fixture_nav() {
 	$link = function ( $t, $u ) { return array( 'title' => $t, 'url' => $u, 'target' => '' ); };
 	$sub  = function ( $t, $u ) use ( $link ) { return array( 'link' => $link( $t, $u ), 'link_style' => 'bold-caret' ); };
@@ -119,28 +119,28 @@ function fixture_nav() {
 	};
 	return array(
 		'nav_items' => array(
-			$top( 'Water Softeners', 'https://culliganjacksonville.com/products/water-softener', array(
+			$top( 'Water Softeners', 'https://example-water.test/products/water-softener', array(
 				array(
 					'sub_item_title' => 'Services',
 					'sub_item_links' => array(
-						$sub( 'Softener Rental', 'https://culliganjacksonville.com/rental' ),
-						$sub( 'Salt Delivery', 'https://culliganjacksonville.com/salt-delivery' ),
+						$sub( 'Softener Rental', 'https://example-water.test/rental' ),
+						$sub( 'Salt Delivery', 'https://example-water.test/salt-delivery' ),
 					),
 				),
 			) ),
 			$top( 'Solution Center', '#', array(
-				array( 'sub_item_title' => '', 'sub_item_links' => array( $sub( 'Hard Water', 'https://culliganjacksonville.com/problems/hard-water' ) ) ),
-				array( 'sub_item_title' => '', 'sub_item_links' => array( $sub( 'PFAS', 'https://culliganjacksonville.com/problems/pfas' ) ) ),
-				array( 'sub_item_title' => 'Counties', 'sub_item_links' => array( $sub( 'Duval', 'https://culliganjacksonville.com/duval' ) ) ),
+				array( 'sub_item_title' => '', 'sub_item_links' => array( $sub( 'Hard Water', 'https://example-water.test/problems/hard-water' ) ) ),
+				array( 'sub_item_title' => '', 'sub_item_links' => array( $sub( 'PFAS', 'https://example-water.test/problems/pfas' ) ) ),
+				array( 'sub_item_title' => 'Counties', 'sub_item_links' => array( $sub( 'Duval', 'https://example-water.test/duval' ) ) ),
 			) ),
-			$top( 'Commercial/Industrial', 'https://culliganjacksonville.com/commercial-industrial' ),
+			$top( 'Commercial/Industrial', 'https://example-water.test/commercial-industrial' ),
 			$top( 'Water Delivery', '#', array(
-				array( 'sub_item_title' => 'Bottled', 'sub_item_links' => array( $sub( '5 Gallon', 'https://culliganjacksonville.com/5-gallon' ) ) ),
+				array( 'sub_item_title' => 'Bottled', 'sub_item_links' => array( $sub( '5 Gallon', 'https://example-water.test/5-gallon' ) ) ),
 			) ),
-			$top( 'About Us', 'https://culliganjacksonville.com/about-us' ),
-			$top( 'Locations', 'https://culliganjacksonville.com/locations' ),
-			$top( 'Specials', 'https://culliganjacksonville.com/specials' ),
-			$top( 'Contact Us', 'https://culliganjacksonville.com/contact-us' ),
+			$top( 'About Us', 'https://example-water.test/about-us' ),
+			$top( 'Locations', 'https://example-water.test/locations' ),
+			$top( 'Specials', 'https://example-water.test/specials' ),
+			$top( 'Contact Us', 'https://example-water.test/contact-us' ),
 		),
 	);
 }
@@ -164,7 +164,7 @@ ok( writes() === 0, 'no matcher => nothing written' );
 
 section( 'remove-item: preview (no confirm)' );
 reset_nav();
-$r = sitebridge_nav_rest_remove_item( req( array( 'url' => 'https://culliganjacksonville.com/contact-us' ) ) );
+$r = sitebridge_nav_rest_remove_item( req( array( 'url' => 'https://example-water.test/contact-us' ) ) );
 ok( ! is_wp_error( $r ), 'preview returns a result, not an error' );
 ok( $r['removed'] === 0, 'preview: removed = 0' );
 ok( $r['confirm_required'] === true, 'preview: confirm_required = true' );
@@ -177,14 +177,14 @@ ok( nav() == $SNAPSHOT, 'preview: nav byte-identical to snapshot' );
 
 section( 'remove-item: trailing-slash / scheme tolerance' );
 reset_nav();
-$r = sitebridge_nav_rest_remove_item( req( array( 'url' => 'https://culliganjacksonville.com/contact-us/' ) ) );
+$r = sitebridge_nav_rest_remove_item( req( array( 'url' => 'https://example-water.test/contact-us/' ) ) );
 ok( ! is_wp_error( $r ) && $r['matched']['title'] === 'Contact Us', 'trailing slash still matches' );
-$r = sitebridge_nav_rest_remove_item( req( array( 'url' => '  https://culliganjacksonville.com/contact-us  ' ) ) );
+$r = sitebridge_nav_rest_remove_item( req( array( 'url' => '  https://example-water.test/contact-us  ' ) ) );
 ok( ! is_wp_error( $r ) && $r['matched']['title'] === 'Contact Us', 'surrounding whitespace still matches' );
 
 section( 'remove-item: confirm on a no-dropdown item' );
 reset_nav();
-$r = sitebridge_nav_rest_remove_item( req( array( 'url' => 'https://culliganjacksonville.com/contact-us', 'confirm' => true ) ) );
+$r = sitebridge_nav_rest_remove_item( req( array( 'url' => 'https://example-water.test/contact-us', 'confirm' => true ) ) );
 ok( ! is_wp_error( $r ), 'confirm: succeeds' );
 ok( $r['removed'] === 1, 'confirm: removed = 1' );
 ok( $r['nav_items_remaining'] === 7, 'confirm: 7 items remain' );
@@ -260,7 +260,7 @@ ok( ! is_wp_error( $r ), 'entity matcher finds the same title' );
 
 section( 'remove-item: round-trip via add_nav_link' );
 reset_nav();
-$r = sitebridge_nav_rest_remove_item( req( array( 'url' => 'https://culliganjacksonville.com/contact-us', 'confirm' => true ) ) );
+$r = sitebridge_nav_rest_remove_item( req( array( 'url' => 'https://example-water.test/contact-us', 'confirm' => true ) ) );
 $removed = $r['removed_item'];
 $a = sitebridge_nav_rest_add_link( req( array(
 	'title'    => $removed['nav_item_link']['title'],
@@ -277,17 +277,17 @@ ok( nav() == $SNAPSHOT, 'nav round-trips byte-identical to the snapshot' );
 section( 'replace-link: title-only rename (new_url optional)' );
 reset_nav();
 $r = sitebridge_nav_rest_replace_link( req( array(
-	'old_url'   => 'https://culliganjacksonville.com/commercial-industrial',
+	'old_url'   => 'https://example-water.test/commercial-industrial',
 	'new_title' => 'Commercial',
 ) ) );
 ok( ! is_wp_error( $r ) && $r['replaced'] === 1, 'rename without new_url replaces 1' );
 ok( $r['title_only'] === true && $r['new_url'] === null, 'response flags title_only' );
 $item = nav()['nav_items'][2];
 ok( $item['nav_item_link']['title'] === 'Commercial', 'title updated' );
-ok( $item['nav_item_link']['url'] === 'https://culliganjacksonville.com/commercial-industrial', 'url untouched' );
+ok( $item['nav_item_link']['url'] === 'https://example-water.test/commercial-industrial', 'url untouched' );
 
 reset_nav();
-$r = sitebridge_nav_rest_replace_link( req( array( 'old_url' => 'https://culliganjacksonville.com/about-us' ) ) );
+$r = sitebridge_nav_rest_replace_link( req( array( 'old_url' => 'https://example-water.test/about-us' ) ) );
 ok( is_wp_error( $r ) && $r->get_error_code() === 'bad_input', 'neither new_url nor new_title => 400' );
 ok( writes() === 0, 'bad input: nothing written' );
 
@@ -298,23 +298,23 @@ ok( is_wp_error( $r ) && $r->get_error_code() === 'bad_input', 'empty old_url =>
 // Scoped title-only rename (sub-link inside a column).
 reset_nav();
 $r = sitebridge_nav_rest_replace_link( req( array(
-	'old_url'      => 'https://culliganjacksonville.com/salt-delivery',
+	'old_url'      => 'https://example-water.test/salt-delivery',
 	'new_title'    => 'Salt & Delivery',
 	'parent_title' => 'Water Softeners',
 ) ) );
 ok( ! is_wp_error( $r ) && $r['replaced'] === 1 && $r['scoped'] === true, 'scoped title-only rename works' );
 $l = nav()['nav_items'][0]['nav_item_sub_items'][0]['sub_item_links'][1];
 ok( $l['link']['title'] === 'Salt & Delivery', 'scoped rename applied' );
-ok( $l['link']['url'] === 'https://culliganjacksonville.com/salt-delivery', 'scoped rename left url alone' );
+ok( $l['link']['url'] === 'https://example-water.test/salt-delivery', 'scoped rename left url alone' );
 
 // URL change still works exactly as before.
 reset_nav();
 $r = sitebridge_nav_rest_replace_link( req( array(
-	'old_url' => 'https://culliganjacksonville.com/specials',
-	'new_url' => 'https://culliganjacksonville.com/offers',
+	'old_url' => 'https://example-water.test/specials',
+	'new_url' => 'https://example-water.test/offers',
 ) ) );
 ok( ! is_wp_error( $r ) && $r['replaced'] === 1 && $r['title_only'] === false, 'plain URL replace unchanged' );
-ok( nav()['nav_items'][6]['nav_item_link']['url'] === 'https://culliganjacksonville.com/offers', 'url replaced' );
+ok( nav()['nav_items'][6]['nav_item_link']['url'] === 'https://example-water.test/offers', 'url replaced' );
 ok( nav()['nav_items'][6]['nav_item_link']['title'] === 'Specials', 'title preserved when no new_title' );
 
 /* ==========================================================================
@@ -327,7 +327,7 @@ $before = count( nav()['nav_items'][1]['nav_item_sub_items'] );
 // column_title normalizes to "" and hits both => 409, no way to add a third.
 $r = sitebridge_nav_rest_add_link( req( array(
 	'title'        => 'Iron',
-	'url'          => 'https://culliganjacksonville.com/problems/iron',
+	'url'          => 'https://example-water.test/problems/iron',
 	'parent_title' => 'Solution Center',
 	'column_title' => ' ',
 	'create_column' => true,
@@ -340,7 +340,7 @@ ok( count( nav()['nav_items'][1]['nav_item_sub_items'] ) === $before, 'old behav
 reset_nav();
 $r = sitebridge_nav_rest_add_link( req( array(
 	'title'         => 'Duval',
-	'url'           => 'https://culliganjacksonville.com/counties/duval',
+	'url'           => 'https://example-water.test/counties/duval',
 	'parent_title'  => 'Solution Center',
 	'column_title'  => 'Counties',
 	'create_column' => true,
@@ -351,7 +351,7 @@ ok( count( nav()['nav_items'][1]['nav_item_sub_items'] ) === $before, 'old behav
 reset_nav();
 $r = sitebridge_nav_rest_add_link( req( array(
 	'title'            => 'Iron',
-	'url'              => 'https://culliganjacksonville.com/problems/iron',
+	'url'              => 'https://example-water.test/problems/iron',
 	'parent_title'     => 'Solution Center',
 	'column_title'     => ' ',
 	'force_new_column' => true,
@@ -365,7 +365,7 @@ ok( nav()['nav_items'][1]['nav_item_sub_items'][0]['sub_item_links'][0]['link'][
 reset_nav();
 $r = sitebridge_nav_rest_add_link( req( array(
 	'title'            => 'Iron',
-	'url'              => 'https://culliganjacksonville.com/problems/iron',
+	'url'              => 'https://example-water.test/problems/iron',
 	'parent_title'     => 'Solution Center',
 	'force_new_column' => true,
 	'column_index'     => 1,
@@ -376,7 +376,7 @@ ok( is_wp_error( $r ) && $r->get_error_code() === 'bad_input', 'force_new_column
 reset_nav();
 $r = sitebridge_nav_rest_add_link( req( array(
 	'title'            => 'Coolers',
-	'url'              => 'https://culliganjacksonville.com/coolers',
+	'url'              => 'https://example-water.test/coolers',
 	'parent_title'     => 'Water Delivery',
 	'column_title'     => 'Coolers',
 	'force_new_column' => true,
@@ -391,7 +391,7 @@ section( 'titles: entities are decoded on write' );
 reset_nav();
 $r = sitebridge_nav_rest_add_link( req( array(
 	'title'         => 'Duval &amp; Nassau',
-	'url'           => 'https://culliganjacksonville.com/duval-nassau',
+	'url'           => 'https://example-water.test/duval-nassau',
 	'parent_title'  => 'Solution Center',
 	'column_title'  => 'St. Johns &amp; Nassau Counties',
 	'create_column' => true,
@@ -408,7 +408,7 @@ reset_nav();
 $GLOBALS['acf_store'][ SITEBRIDGE_NAV_FIELD ]['nav_items'][1]['nav_item_sub_items'][2]['sub_item_title'] = 'St. Johns &amp; Nassau';
 $r = sitebridge_nav_rest_add_link( req( array(
 	'title'        => 'Clay',
-	'url'          => 'https://culliganjacksonville.com/clay',
+	'url'          => 'https://example-water.test/clay',
 	'parent_title' => 'Solution Center',
 	'column_title' => 'St. Johns & Nassau',
 ) ) );
@@ -417,7 +417,7 @@ ok( ! is_wp_error( $r ) && $r['column_index'] === 2, 'plain "&" column_title mat
 reset_nav();
 $GLOBALS['acf_store'][ SITEBRIDGE_NAV_FIELD ]['nav_items'][1]['nav_item_link']['title'] = 'Solution &amp; Center';
 $r = sitebridge_nav_rest_remove_link( req( array(
-	'url'          => 'https://culliganjacksonville.com/problems/pfas',
+	'url'          => 'https://example-water.test/problems/pfas',
 	'parent_title' => 'Solution & Center',
 ) ) );
 ok( ! is_wp_error( $r ) && $r['removed'] === 1, 'plain "&" parent_title matches a stored "&amp;" parent (remove-link)' );
@@ -432,17 +432,17 @@ ok( is_wp_error( $r ) && $r->get_error_code() === 'duplicate', 'case-insensitive
  * ======================================================================== */
 section( 'regression: remove-link is unchanged' );
 reset_nav();
-$r = sitebridge_nav_rest_remove_link( req( array( 'url' => 'https://culliganjacksonville.com/contact-us' ) ) );
+$r = sitebridge_nav_rest_remove_link( req( array( 'url' => 'https://example-water.test/contact-us' ) ) );
 ok( ! is_wp_error( $r ) && $r['removed'] === 0, 'remove-link still returns removed:0 for a top-level item' );
 ok( count( nav()['nav_items'] ) === 8, 'remove-link left all 8 items in place' );
 
 reset_nav();
-$r = sitebridge_nav_rest_remove_link( req( array( 'url' => 'https://culliganjacksonville.com/salt-delivery' ) ) );
+$r = sitebridge_nav_rest_remove_link( req( array( 'url' => 'https://example-water.test/salt-delivery' ) ) );
 ok( ! is_wp_error( $r ) && $r['removed'] === 1, 'remove-link still removes sub-links' );
 ok( count( nav()['nav_items'][0]['nav_item_sub_items'][0]['sub_item_links'] ) === 1, 'sub-link removed from the column' );
 
 reset_nav();
-$r = sitebridge_nav_rest_remove_link( req( array( 'url' => 'https://culliganjacksonville.com/5-gallon' ) ) );
+$r = sitebridge_nav_rest_remove_link( req( array( 'url' => 'https://example-water.test/5-gallon' ) ) );
 ok( ! is_wp_error( $r ) && $r['removed'] === 1, 'remove-link empties a single-link column' );
 ok( nav()['nav_items'][3]['nav_item_sub_items'] === false, 'emptied parent gets sub_items = false (pruning unchanged)' );
 

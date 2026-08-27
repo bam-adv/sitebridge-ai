@@ -46,7 +46,7 @@ const SITEBRIDGE_UPDATE_PUBKEY = 'YN/8ey9X7JLyGQEp6binEwL3tQrJTLTYp+dxjjsuZOE=';
 const SITEBRIDGE_SCHEMA_META_KEY        = '_bam_schema_jsonld';
 const SITEBRIDGE_SCHEMA_TEMPLATE_PREFIX = 'bam_schema_template_';
 
-// --- Navigation (Culligan v4 theme profile) ----------------------------------
+// --- Navigation (Profile A v4 theme profile) ----------------------------------
 if ( ! defined( 'SITEBRIDGE_NAV_OPTION_ID' ) )     define( 'SITEBRIDGE_NAV_OPTION_ID', 'option' );
 if ( ! defined( 'SITEBRIDGE_NAV_FIELD' ) )         define( 'SITEBRIDGE_NAV_FIELD', 'main_nav_settings_version_2' );
 if ( ! defined( 'SITEBRIDGE_NAV_VERSION_FIELD' ) ) define( 'SITEBRIDGE_NAV_VERSION_FIELD', 'main_nav_version' );
@@ -54,7 +54,7 @@ if ( ! defined( 'SITEBRIDGE_NAV_VERSION_FIELD' ) ) define( 'SITEBRIDGE_NAV_VERSI
 // --- Redirects (kept as legacy option key for data compatibility) ------------
 if ( ! defined( 'SITEBRIDGE_REDIRECTS_OPTION' ) )  define( 'SITEBRIDGE_REDIRECTS_OPTION', 'bam_redirects' );
 
-// --- Hero exclusivity (Culligan v4 theme profile) -----------------------------
+// --- Hero exclusivity (Profile A v4 theme profile) -----------------------------
 // A page renders its hero EITHER from an acf/hero-banner block in post_content
 // OR from the page-level meta-box group toggled by show_hero_banner. Both at
 // once double-renders the hero, so /acf-fields refuses to set the toggle true
@@ -472,7 +472,7 @@ function sitebridge_nav_rest_get() {
 /**
  * Feature 3 bonus: flag nav link URLs whose stored value carries surrounding
  * whitespace (stored !== trimmed). url_eq() now trims so these still match, but
- * surfacing them makes one-time cleanups auditable (e.g. " https://culligancares.org/").
+ * surfacing them makes one-time cleanups auditable (e.g. " https://example-water.test/").
  */
 function sitebridge_nav_untrimmed_urls( $nav ) {
 	$flagged = array();
@@ -676,7 +676,7 @@ function sitebridge_nav_rest_replace_link( WP_REST_Request $req ) {
 /**
  * Trailing-slash tolerant URL comparison (used by replace-link and remove-link).
  * Also trims surrounding whitespace first: some stored ACF nav URLs carry a stray
- * leading space (e.g. " https://culligancares.org/"), which otherwise makes every
+ * leading space (e.g. " https://example-water.test/"), which otherwise makes every
  * URL variant fail to match. trim() both sides, then ignore trailing slashes.
  */
 function sitebridge_nav_url_eq( $a, $b ) {
@@ -719,7 +719,7 @@ function sitebridge_nav_columns_listing( $sub_items ) {
 }
 
 /**
- * Add a link to the desktop mega-menu (Culligan v4 theme shape:
+ * Add a link to the desktop mega-menu (Profile A v4 theme shape:
  * nav_items[] -> nav_item_link / nav_item_sub_items[] (columns) -> sub_item_links[]).
  *
  * - No parent_title           => append/insert a new TOP-LEVEL nav item.
@@ -2790,7 +2790,7 @@ function sitebridge_cap_hosting( $deadline ) {
 // simple content types (wysiwyg/textarea) and complex structures
 // (repeater/flexible_content/group). Local-JSON groups register on init, so
 // this sees them. NEVER uses get_field() — value retrieval runs theme filters
-// that can fatal (culligan-v4's decrypt filter is the proven case).
+// that can fatal (profile-a-v4's decrypt filter is the proven case).
 function sitebridge_cap_acf_field_maps() {
 	static $maps = null;
 	if ( $maps !== null ) {
@@ -3072,7 +3072,7 @@ function sitebridge_cap_nav( $deadline ) {
 
 	// Generic ACF options-page nav: a field group located on an options page
 	// with a repeater/group/flexible field named like nav/menu — confirmed by
-	// raw options rows (existence only; never get_field()). The Culligan
+	// raw options rows (existence only; never get_field()). A profile-A
 	// mega-menu (main_nav_settings_version_2) is one instance of this.
 	$acf_nav = false;
 	$maps    = sitebridge_cap_acf_field_maps();

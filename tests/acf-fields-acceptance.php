@@ -241,7 +241,7 @@ class FakeWpdb {
 $GLOBALS['wpdb'] = new FakeWpdb();
 
 // -------------------------------------------------------- ACF emulation -----
-// Field registry mirrors the real Culligan v4 meta-box group (real keys).
+// Field registry mirrors the real Profile A v4 meta-box group (real keys).
 $GLOBALS['acf_fields'] = array();
 function acf_register_test_field( $field ) {
 	$GLOBALS['acf_fields'][ $field['key'] ] = $field;
