@@ -12,7 +12,7 @@
  * Run:  php tests/purge-acceptance.php     (exit 0 = all assertions passed)
  *
  * This covers the LOGIC. The live acceptance pass — a real NitroPack-connected
- * site (Escondido) going x-nitro-cache: MISS after a purge — is still required.
+ * a live production site going x-nitro-cache: MISS after a purge — is still required.
  */
 
 $scenario = getenv( 'SB_PURGE_SCENARIO' );

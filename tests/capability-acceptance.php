@@ -13,14 +13,14 @@
  *
  * This covers the LOGIC — including the read-only assertion at the $wpdb/
  * options layer. The live acceptance pass (query log on a real site showing
- * zero writes, Dallas/San Diego pre-audit diffs) is still required.
+ * zero writes, pre-audit diffs on two production sites) is still required.
  */
 
 $scenario = getenv( 'SB_CAP_SCENARIO' );
 
 // ------------------------------------------------------------------ runner --
 if ( $scenario === false ) {
-	$scenarios = array( 'culligan', 'no-acf', 'builder', 'fallback', 'section-fail' );
+	$scenarios = array( 'profile-a', 'no-acf', 'builder', 'fallback', 'section-fail' );
 	$failed    = array();
 	foreach ( $scenarios as $s ) {
 		echo "\n\033[1mscenario: $s\033[0m\n";
@@ -130,12 +130,12 @@ $GLOBALS['get_field_calls'] = array();
 // ---- theme -----------------------------------------------------------------
 class SB_Test_Theme {
 	public function get( $k ) {
-		if ( $k === 'Name' )    { return 'Culligan v4'; }
+		if ( $k === 'Name' )    { return 'Profile A v4'; }
 		if ( $k === 'Version' ) { return '4.2.0'; }
 		return '';
 	}
 	public function parent() { return null; }
-	public function get_template() { return 'culligan-v4'; }
+	public function get_template() { return 'profile-a-v4'; }
 }
 function wp_get_theme() { return new SB_Test_Theme(); }
 
@@ -211,7 +211,7 @@ function sb_types( $names ) {
 }
 
 switch ( $scenario ) {
-	case 'culligan':
+	case 'profile-a':
 	case 'fallback':
 	case 'section-fail':
 		define( 'ACF_VERSION', '6.8.4' );
@@ -355,7 +355,7 @@ ok( $GLOBALS['get_field_calls'] === array(), 'collector never calls get_field()'
 ok( $f['read_only_attestation']['writes_performed'] === 0, 'attestation reports zero writes' );
 
 switch ( $scenario ) {
-	case 'culligan':
+	case 'profile-a':
 		section( 'collection status' );
 		ok( $f['collection_status']['complete'] === true, 'complete' );
 		ok( $f['collection_status']['failed_sections'] === array(), 'no failed sections' );
@@ -363,7 +363,7 @@ switch ( $scenario ) {
 		section( 'environment / editor' );
 		ok( $f['environment']['wp_version'] === '6.7.1', 'wp version' );
 		ok( $f['environment']['https'] === true, 'https' );
-		ok( $f['environment']['theme']['name'] === 'Culligan v4', 'theme name' );
+		ok( $f['environment']['theme']['name'] === 'Profile A v4', 'theme name' );
 		ok( $f['editor']['gutenberg_available'] === true, 'gutenberg available' );
 		ok( $f['editor']['classic_editor_plugin'] === false, 'no classic editor plugin' );
 		ok( $f['editor']['default_editor'] === 'block', 'default editor block' );

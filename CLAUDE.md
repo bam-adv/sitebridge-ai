@@ -105,7 +105,7 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   count row (the sweep now scans by real row index, not the old `[after,before)` window). Rows of
   a neighbouring field whose name collides with a row index (`{name}_2_…` vs field `{name}_2`) are
   excluded — the index is skipped when `{name}_{i}` resolves to a registered field. Hero exclusivity guard (CONFIG:
-  `SITEBRIDGE_HERO_BLOCK`/`SITEBRIDGE_HERO_TOGGLE`, Culligan profile, '' disables): setting the
+  `SITEBRIDGE_HERO_BLOCK`/`SITEBRIDGE_HERO_TOGGLE`, defaults suit one common theme profile, '' disables): setting the
   toggle true on a post whose content carries the hero block → 409 `hero_conflict` (double
   render); setting it false is the sanctioned state on block pages.
 - **Cache purge** (v1.15+): `POST /purge-cache` — optional `url` (path or absolute; per-URL purge
@@ -162,9 +162,9 @@ false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 non-NitroPack hosts (WP Engine sites must return byte-identical purge responses).
 
 `php tests/capability-acceptance.php` — 96 assertions over the capability-findings route, five
-subprocess scenarios (culligan-shaped, no-ACF, builder, schema-fetch fallback, section failure).
+subprocess scenarios (profile-a-shaped, no-ACF, builder, schema-fetch fallback, section failure).
 Every scenario asserts read-only at the SQL/options layer and that `get_field()` is never called.
-Its live assumptions (real query log shows zero writes; Dallas/San Diego pre-audit diffs) are the
+Its live assumptions (real query log shows zero writes; pre-audit diffs on two production sites) are the
 release acceptance pass.
 
 ## Self-updater
