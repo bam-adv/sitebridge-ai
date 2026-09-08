@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.18.0
+ * Version:     1.19.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.18.0' );
+define( 'SITEBRIDGE_VERSION', '1.19.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -2143,10 +2143,17 @@ function sitebridge_purge_cache_rest( WP_REST_Request $req ) {
 	$url     = ( $req['url'] !== null ) ? trim( (string) $req['url'] ) : '';
 	$post_id = ( $req['post_id'] !== null ) ? (int) $req['post_id'] : 0;
 
+	if ( $post_id > 0 && ! get_post( $post_id ) ) {
+		return new WP_Error( 'not_found', sprintf( 'No post with ID %d', $post_id ), array( 'status' => 404 ) );
+	}
+
+	return sitebridge_purge_cache_run( $url, $post_id );
+}
+
+// Engine-firing core, callable outside REST (the scheduled-republish merge hook
+// purges the republished URL through this exact path).
+function sitebridge_purge_cache_run( $url = '', $post_id = 0 ) {
 	if ( $post_id > 0 ) {
-		if ( ! get_post( $post_id ) ) {
-			return new WP_Error( 'not_found', sprintf( 'No post with ID %d', $post_id ), array( 'status' => 404 ) );
-		}
 		clean_post_cache( $post_id );
 		if ( $url === '' ) {
 			$url = get_permalink( $post_id );
@@ -2326,6 +2333,475 @@ function sitebridge_purge_cache_rest( WP_REST_Request $req ) {
 		'note'     => $note,
 	);
 }
+
+/* ============================================================================
+ * SCHEDULED REPUBLISH  (v1.19.0) — stage a plain staging draft as a Yoast
+ * Duplicate Post "Rewrite & Republish" copy of a live post and schedule the
+ * merge. The original stays live the whole time; at the scheduled datetime
+ * Duplicate Post merges the copy's content into the original (same post ID,
+ * slug, permalink, comments) and deletes the copy.
+ *
+ * Core WP can't do this: post_status=future on a published post takes the URL
+ * dark until the schedule fires. Duplicate Post can, but scheduling its copy
+ * the normal way re-dates the original — the copy's future post_date rides
+ * into the original on merge (Post_Republisher::republish_post_elements clones
+ * the copy, dates included, onto the original's ID). So this module captures
+ * the original's post_date/post_date_gmt at schedule time and restores them
+ * right after the merge, unless the caller opts into re-dating.
+ *
+ * All Duplicate Post integration below was verified against the 4.7 source
+ * (the fleet's installed version):
+ *   copy meta:     _dp_original (original ID), _dp_is_rewrite_republish_copy=1,
+ *                  _dp_creation_date_gmt
+ *   original meta: _dp_has_rewrite_republish_copy (copy ID)
+ *   merge trigger: future_to_publish → Post_Republisher::republish_scheduled_post
+ *                  → republish() → fires duplicate_post_after_republish (4.6+)
+ *                  → delete_copy() (unconditional — hence no delete_copy_after:false)
+ * ========================================================================== */
+
+const SITEBRIDGE_V1_NS = 'sitebridge/v1'; // same namespace as capability-findings (new surface; bam/* stays legacy-frozen)
+
+const SITEBRIDGE_REPUBLISH_LOG_OPTION = 'sitebridge_republish_log';
+
+// Staging markers on the copy. _sitebridge_republish_scheduled gates the merge
+// hook so manual Duplicate Post use is never touched by this module.
+const SITEBRIDGE_REPUBLISH_MARKER_KEY     = '_sitebridge_republish_scheduled';
+const SITEBRIDGE_REPUBLISH_YOAST_KEY      = '_sitebridge_copy_yoast_meta';
+const SITEBRIDGE_REPUBLISH_DATE_KEY       = '_sitebridge_restore_post_date';
+const SITEBRIDGE_REPUBLISH_DATE_GMT_KEY   = '_sitebridge_restore_post_date_gmt';
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( SITEBRIDGE_V1_NS, '/schedule-republish', array(
+		'methods'             => 'POST',
+		'callback'            => 'sitebridge_schedule_republish_rest',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+		'args'                => array(
+			'draft_id'              => array( 'required' => true,  'type' => 'integer' ),
+			'target_id'             => array( 'required' => true,  'type' => 'integer' ),
+			'publish_at'            => array( 'required' => true,  'type' => 'string' ),
+			'timezone'              => array( 'required' => false, 'type' => 'string' ),
+			'preserve_publish_date' => array( 'required' => false, 'type' => 'boolean' ),
+			'copy_yoast_meta'       => array( 'required' => false, 'type' => 'boolean' ),
+			'delete_copy_after'     => array( 'required' => false, 'type' => 'boolean' ),
+		),
+	) );
+	register_rest_route( SITEBRIDGE_V1_NS, '/scheduled-republishes', array(
+		'methods'             => 'GET',
+		'callback'            => 'sitebridge_list_republishes_rest',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+	) );
+	register_rest_route( SITEBRIDGE_V1_NS, '/scheduled-republish/(?P<draft_id>\d+)', array(
+		'methods'             => 'DELETE',
+		'callback'            => 'sitebridge_cancel_republish_rest',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+	) );
+} );
+
+function sitebridge_republish_dp_active() {
+	// Autoloads via Duplicate Post's composer autoloader when the plugin is active.
+	return class_exists( '\Yoast\WP\Duplicate_Post\Post_Republisher' );
+}
+
+// Small capped run log in an option so a LATER session (or the list route) can
+// confirm a queued batch actually shipped without reading server logs.
+function sitebridge_republish_log_append( $entry ) {
+	$log = get_option( SITEBRIDGE_REPUBLISH_LOG_OPTION, array() );
+	if ( ! is_array( $log ) ) {
+		$log = array();
+	}
+	$log[] = $entry;
+	if ( count( $log ) > 50 ) {
+		$log = array_slice( $log, -50 );
+	}
+	update_option( SITEBRIDGE_REPUBLISH_LOG_OPTION, $log, false );
+	error_log( 'SiteBridge schedule-republish: ' . wp_json_encode( $entry ) );
+}
+
+/**
+ * Parse publish_at against the requested timezone. Returns DateTimeImmutable
+ * or WP_Error. 'site' (or empty) = the WP timezone setting; otherwise an IANA
+ * name. A publish_at carrying its own explicit offset/Z wins over both (PHP
+ * semantics), which is the least surprising reading of such an input.
+ */
+function sitebridge_republish_parse_when( $publish_at, $timezone ) {
+	$timezone = ( $timezone === null ) ? 'site' : trim( (string) $timezone );
+	if ( $timezone === '' || $timezone === 'site' ) {
+		$tz = wp_timezone();
+	} else {
+		try {
+			$tz = new DateTimeZone( $timezone );
+		} catch ( \Exception $e ) {
+			return new WP_Error( 'bad_timezone', sprintf( '"%s" is not a valid IANA timezone (or "site").', $timezone ), array( 'status' => 400 ) );
+		}
+	}
+	try {
+		return new DateTimeImmutable( (string) $publish_at, $tz );
+	} catch ( \Exception $e ) {
+		return new WP_Error( 'bad_datetime', sprintf( 'Could not parse publish_at "%s" — use e.g. "2026-09-15T09:00:00".', (string) $publish_at ), array( 'status' => 400 ) );
+	}
+}
+
+function sitebridge_schedule_republish_rest( WP_REST_Request $req ) {
+	if ( ! sitebridge_republish_dp_active() ) {
+		return new WP_Error(
+			'duplicate_post_missing',
+			'Yoast Duplicate Post is not active on this site — schedule-republish stages its Rewrite & Republish copies and cannot work without it.',
+			array( 'status' => 501 )
+		);
+	}
+
+	$draft_id   = (int) $req['draft_id'];
+	$target_id  = (int) $req['target_id'];
+	$preserve   = ( $req['preserve_publish_date'] === null ) ? true : (bool) $req['preserve_publish_date'];
+	$copy_yoast = ( $req['copy_yoast_meta'] === null ) ? true : (bool) $req['copy_yoast_meta'];
+
+	if ( $req['delete_copy_after'] !== null && ! $req['delete_copy_after'] ) {
+		return new WP_Error(
+			'unsupported_option',
+			'delete_copy_after:false is not supported — Duplicate Post itself always deletes the copy after a scheduled merge (Post_Republisher::republish_scheduled_post), and this endpoint cannot prevent that.',
+			array( 'status' => 400 )
+		);
+	}
+
+	if ( $draft_id === $target_id ) {
+		return new WP_Error( 'same_post', 'draft_id and target_id are the same post.', array( 'status' => 400 ) );
+	}
+
+	$draft  = get_post( $draft_id );
+	$target = get_post( $target_id );
+	if ( ! $draft ) {
+		return new WP_Error( 'draft_not_found', sprintf( 'No post with ID %d (draft_id).', $draft_id ), array( 'status' => 404 ) );
+	}
+	if ( ! $target ) {
+		return new WP_Error( 'target_not_found', sprintf( 'No post with ID %d (target_id).', $target_id ), array( 'status' => 404 ) );
+	}
+	if ( $target->post_status !== 'publish' ) {
+		return new WP_Error( 'target_not_published', sprintf( 'Target #%d has status "%s" — the merge target must be a published post.', $target_id, $target->post_status ), array( 'status' => 409 ) );
+	}
+	if ( $draft->post_type !== $target->post_type ) {
+		return new WP_Error( 'post_type_mismatch', sprintf( 'Draft is a "%s" but target is a "%s" — the merge only works within one post type.', $draft->post_type, $target->post_type ), array( 'status' => 409 ) );
+	}
+
+	// Link conflict first — it's the more informative error when a copy is
+	// already scheduled against some OTHER post.
+	$linked = (int) get_post_meta( $draft_id, '_dp_original', true );
+	if ( $linked && $linked !== $target_id ) {
+		return new WP_Error( 'draft_linked_elsewhere', sprintf( 'Draft #%d is already a rewrite copy of post #%d — it cannot be scheduled against #%d.', $draft_id, $linked, $target_id ), array( 'status' => 409 ) );
+	}
+
+	// Rescheduling: a copy this module already staged against the SAME target
+	// may be re-scheduled directly (no cancel round-trip needed).
+	$already_ours = ( (int) get_post_meta( $draft_id, SITEBRIDGE_REPUBLISH_MARKER_KEY, true ) === 1 )
+		&& ( $linked === $target_id );
+	$rescheduling = ( $draft->post_status === 'future' && $already_ours );
+	if ( $draft->post_status !== 'draft' && ! $rescheduling ) {
+		return new WP_Error( 'draft_not_draft', sprintf( 'Post #%d has status "%s" — it must be a draft (or a sitebridge-scheduled copy of the same target, to reschedule).', $draft_id, $draft->post_status ), array( 'status' => 409 ) );
+	}
+
+	$notes        = array();
+	$pending_copy = (int) get_post_meta( $target_id, '_dp_has_rewrite_republish_copy', true );
+	if ( $pending_copy && $pending_copy !== $draft_id ) {
+		$c = get_post( $pending_copy );
+		if ( $c && in_array( $c->post_status, array( 'draft', 'future', 'dp-rewrite-republish' ), true ) ) {
+			return new WP_Error( 'target_has_pending_copy', sprintf( 'Target #%d already has a pending rewrite copy: #%d (status "%s"). Merge or cancel that one first.', $target_id, $pending_copy, $c->post_status ), array( 'status' => 409 ) );
+		}
+		$notes[] = sprintf( 'Target carried a stale rewrite-copy pointer to post #%d (deleted or finished) — replaced.', $pending_copy );
+	}
+
+	$when = sitebridge_republish_parse_when( $req['publish_at'], $req['timezone'] );
+	if ( is_wp_error( $when ) ) {
+		return $when;
+	}
+	if ( $when->getTimestamp() <= time() ) {
+		return new WP_Error( 'publish_at_past', sprintf( 'publish_at resolves to %s UTC, which is not in the future.', $when->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' ) ), array( 'status' => 400 ) );
+	}
+
+	$post_date_gmt = $when->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' );
+	$post_date     = $when->setTimezone( wp_timezone() )->format( 'Y-m-d H:i:s' );
+
+	// Capture the original's dates BEFORE anything is written — this is what
+	// the merge hook restores (the re-dating trap; see the module header).
+	$original_date     = $target->post_date;
+	$original_date_gmt = $target->post_date_gmt;
+
+	// Schedule the copy first: the one write that can realistically fail, so a
+	// failure here leaves nothing half-staged. Core's _transition_post_status
+	// schedules the publish_future_post cron event off this same update.
+	$updated = wp_update_post( array(
+		'ID'            => $draft_id,
+		'post_status'   => 'future',
+		'post_date'     => $post_date,
+		'post_date_gmt' => $post_date_gmt,
+	), true );
+	if ( is_wp_error( $updated ) ) {
+		return new WP_Error( 'schedule_failed', sprintf( 'Could not schedule draft #%d: %s', $draft_id, $updated->get_error_message() ), array( 'status' => 500 ) );
+	}
+
+	// Duplicate Post staging meta (keys verified against the 4.7 source).
+	update_post_meta( $draft_id, '_dp_original', $target_id );
+	update_post_meta( $draft_id, '_dp_is_rewrite_republish_copy', 1 );
+	if ( ! get_post_meta( $draft_id, '_dp_creation_date_gmt', true ) ) {
+		update_post_meta( $draft_id, '_dp_creation_date_gmt', current_time( 'mysql', 1 ) );
+	}
+	update_post_meta( $target_id, '_dp_has_rewrite_republish_copy', $draft_id );
+
+	// SiteBridge staging meta (gates the merge hook + carries the restore dates).
+	update_post_meta( $draft_id, SITEBRIDGE_REPUBLISH_MARKER_KEY, 1 );
+	update_post_meta( $draft_id, SITEBRIDGE_REPUBLISH_YOAST_KEY, $copy_yoast ? 1 : 0 );
+	if ( $preserve ) {
+		update_post_meta( $draft_id, SITEBRIDGE_REPUBLISH_DATE_KEY, $original_date );
+		update_post_meta( $draft_id, SITEBRIDGE_REPUBLISH_DATE_GMT_KEY, $original_date_gmt );
+	} else {
+		delete_post_meta( $draft_id, SITEBRIDGE_REPUBLISH_DATE_KEY );
+		delete_post_meta( $draft_id, SITEBRIDGE_REPUBLISH_DATE_GMT_KEY );
+	}
+
+	// Mirror the target's taxonomy terms onto the draft where the draft has
+	// none. DP's merge sets the original's terms to the COPY's terms for every
+	// taxonomy (category is explicitly cleared first) — a real DP clone carries
+	// the original's terms, but our staging drafts are fresh posts, so without
+	// this an unmirrored draft would WIPE the live post's categories/tags at
+	// merge time. A draft with deliberately chosen terms is left alone (only
+	// the auto-assigned default category counts as "none").
+	$mirrored = array();
+	foreach ( get_object_taxonomies( $target->post_type ) as $tax ) {
+		$draft_terms = wp_get_object_terms( $draft_id, $tax, array( 'fields' => 'ids' ) );
+		if ( is_wp_error( $draft_terms ) ) {
+			continue;
+		}
+		$only_default = ( $tax === 'category' && count( $draft_terms ) === 1
+			&& (int) $draft_terms[0] === (int) get_option( 'default_category' ) );
+		if ( ! empty( $draft_terms ) && ! $only_default ) {
+			continue;
+		}
+		$target_terms = wp_get_object_terms( $target_id, $tax, array( 'fields' => 'ids' ) );
+		if ( is_wp_error( $target_terms ) || empty( $target_terms ) ) {
+			continue;
+		}
+		wp_set_object_terms( $draft_id, array_map( 'intval', $target_terms ), $tax );
+		$mirrored[] = $tax;
+	}
+
+	$cron_ts = wp_next_scheduled( 'publish_future_post', array( $draft_id ) );
+	if ( ! $cron_ts ) {
+		$notes[] = 'WARNING: WordPress reports no publish_future_post cron event for this copy — the daily sitebridge_republish_sweep will still merge it after the scheduled time passes.';
+	}
+
+	return array(
+		'scheduled'             => true,
+		'rescheduled'           => $rescheduling,
+		'draft_id'              => $draft_id,
+		'target_id'             => $target_id,
+		'target_url'            => get_permalink( $target_id ),
+		'publish_at_utc'        => str_replace( ' ', 'T', $post_date_gmt ) . 'Z',
+		'publish_at_site'       => str_replace( ' ', 'T', $post_date ),
+		'copy_status'           => get_post_status( $draft_id ),
+		'dp_original_set'       => ( (int) get_post_meta( $draft_id, '_dp_original', true ) === $target_id ),
+		'preserve_publish_date' => $preserve,
+		'copy_yoast_meta'       => $copy_yoast,
+		'original_post_date'    => str_replace( ' ', 'T', $original_date ),
+		'taxonomies_mirrored'   => $mirrored,
+		'cron_event_utc'        => $cron_ts ? gmdate( 'Y-m-d\TH:i:s\Z', $cron_ts ) : null,
+		'notes'                 => $notes,
+	);
+}
+
+/**
+ * Post-merge hook. Fires inside Post_Republisher::republish(), AFTER the
+ * copy's row (dates included) was written onto the original and before
+ * Duplicate Post deletes the copy — so the copy's meta is still readable.
+ * Only acts on copies this module staged; manual Duplicate Post use is
+ * untouched.
+ */
+add_action( 'duplicate_post_after_republish', 'sitebridge_republish_after_merge', 20, 2 );
+function sitebridge_republish_after_merge( $copy, $original ) {
+	if ( ! ( $copy instanceof WP_Post ) || ! ( $original instanceof WP_Post ) ) {
+		return;
+	}
+	if ( (int) get_post_meta( $copy->ID, SITEBRIDGE_REPUBLISH_MARKER_KEY, true ) !== 1 ) {
+		return;
+	}
+
+	$restore_requested = false;
+	$restored          = false;
+	$rd  = (string) get_post_meta( $copy->ID, SITEBRIDGE_REPUBLISH_DATE_KEY, true );
+	$rdg = (string) get_post_meta( $copy->ID, SITEBRIDGE_REPUBLISH_DATE_GMT_KEY, true );
+	if ( $rd !== '' && $rdg !== '' ) {
+		$restore_requested = true;
+		// Restore with a direct column write, NOT wp_update_post(): a full
+		// re-save round-trips post_content (which re-normalizes ACF block JSON
+		// — the same reason /search-replace writes raw) and would also touch
+		// post_modified, which must stay at merge time so dateModified moves
+		// while datePublished does not.
+		global $wpdb;
+		$ok = $wpdb->update(
+			$wpdb->posts,
+			array( 'post_date' => $rd, 'post_date_gmt' => $rdg ),
+			array( 'ID' => $original->ID ),
+			array( '%s', '%s' ),
+			array( '%d' )
+		);
+		clean_post_cache( $original->ID );
+		$check    = get_post( $original->ID );
+		$restored = ( $ok !== false ) && $check && ( $check->post_date_gmt === $rdg );
+	}
+
+	$yoast_copied = array();
+	if ( (int) get_post_meta( $copy->ID, SITEBRIDGE_REPUBLISH_YOAST_KEY, true ) === 1 ) {
+		// Belt-and-braces: 4.7's republish path copies the copy's meta itself
+		// with use_filters=false (admin excludelist settings NOT consulted),
+		// but that's an implementation detail of the merge — copy the three
+		// Yoast keys explicitly so a future Duplicate Post version consulting
+		// its global, human-editable settings can't silently drop them.
+		foreach ( array( '_yoast_wpseo_title', '_yoast_wpseo_metadesc', '_yoast_wpseo_focuskw' ) as $k ) {
+			$v = get_post_meta( $copy->ID, $k, true );
+			if ( $v !== '' && $v !== false && $v !== null ) {
+				update_post_meta( $original->ID, $k, $v );
+				$yoast_copied[] = $k;
+			}
+		}
+	}
+
+	// A republished post behind a stale edge cache looks like the merge failed
+	// — purge the target URL through the same path purge-cache uses.
+	$url   = get_permalink( $original->ID );
+	$purge = sitebridge_purge_cache_run( $url, $original->ID );
+
+	sitebridge_republish_log_append( array(
+		'time'                    => gmdate( 'Y-m-d\TH:i:s\Z' ),
+		'event'                   => 'merged',
+		'draft_id'                => $copy->ID,
+		'target_id'               => $original->ID,
+		'url'                     => $url,
+		'publish_date_preserved'  => $restore_requested ? $restored : 'off',
+		'yoast_meta_copied'       => $yoast_copied,
+		'cache_purge_fired'       => isset( $purge['fired'] ) ? $purge['fired'] : array(),
+	) );
+
+	if ( $restore_requested && ! $restored ) {
+		error_log( sprintf( 'SiteBridge schedule-republish: FAILED to restore post_date on #%d after merge — the post now carries the scheduled date.', $original->ID ) );
+	}
+}
+
+function sitebridge_list_republishes_rest( $req ) {
+	$copies = get_posts( array(
+		'post_type'   => 'any',
+		'post_status' => array( 'future', 'draft', 'dp-rewrite-republish' ),
+		'numberposts' => 200,
+		'meta_key'    => '_dp_is_rewrite_republish_copy',
+		'meta_value'  => 1,
+		'orderby'     => 'date',
+		'order'       => 'ASC',
+	) );
+
+	$now   = time();
+	$items = array();
+	foreach ( $copies as $c ) {
+		$target_id = (int) get_post_meta( $c->ID, '_dp_original', true );
+		$sched_ts  = ( $c->post_date_gmt && $c->post_date_gmt !== '0000-00-00 00:00:00' )
+			? strtotime( $c->post_date_gmt . ' UTC' )
+			: false;
+		$items[] = array(
+			'draft_id'              => $c->ID,
+			'post_type'             => $c->post_type,
+			'target_id'             => $target_id ? $target_id : null,
+			'target_url'            => $target_id ? get_permalink( $target_id ) : null,
+			'copy_status'           => $c->post_status,
+			'scheduled_at_utc'      => ( $c->post_status === 'future' && $sched_ts ) ? str_replace( ' ', 'T', $c->post_date_gmt ) . 'Z' : null,
+			'past_due'              => ( $c->post_status === 'future' && $sched_ts && $sched_ts < ( $now - 5 * MINUTE_IN_SECONDS ) ),
+			'staged_by_sitebridge'  => ( (int) get_post_meta( $c->ID, SITEBRIDGE_REPUBLISH_MARKER_KEY, true ) === 1 ),
+			'preserve_publish_date' => ( (string) get_post_meta( $c->ID, SITEBRIDGE_REPUBLISH_DATE_GMT_KEY, true ) !== '' ),
+		);
+	}
+
+	return array(
+		'count'      => count( $items ),
+		'scheduled'  => $items,
+		'recent_log' => array_slice( (array) get_option( SITEBRIDGE_REPUBLISH_LOG_OPTION, array() ), -20 ),
+	);
+}
+
+function sitebridge_cancel_republish_rest( WP_REST_Request $req ) {
+	$draft_id = (int) $req['draft_id'];
+	$copy     = get_post( $draft_id );
+	if ( ! $copy ) {
+		return new WP_Error( 'not_found', sprintf( 'No post with ID %d.', $draft_id ), array( 'status' => 404 ) );
+	}
+	if ( (int) get_post_meta( $draft_id, '_dp_is_rewrite_republish_copy', true ) !== 1 ) {
+		return new WP_Error( 'not_a_rewrite_copy', sprintf( 'Post #%d is not a rewrite-and-republish copy.', $draft_id ), array( 'status' => 409 ) );
+	}
+	if ( $copy->post_status !== 'future' ) {
+		return new WP_Error( 'not_scheduled', sprintf( 'Copy #%d has status "%s" — only a scheduled (future) copy can be canceled.', $draft_id, $copy->post_status ), array( 'status' => 409 ) );
+	}
+
+	$res = wp_update_post( array( 'ID' => $draft_id, 'post_status' => 'draft' ), true );
+	if ( is_wp_error( $res ) ) {
+		return new WP_Error( 'cancel_failed', sprintf( 'Could not cancel copy #%d: %s', $draft_id, $res->get_error_message() ), array( 'status' => 500 ) );
+	}
+	wp_clear_scheduled_hook( 'publish_future_post', array( $draft_id ) );
+
+	$target_id = (int) get_post_meta( $draft_id, '_dp_original', true );
+	sitebridge_republish_log_append( array(
+		'time'      => gmdate( 'Y-m-d\TH:i:s\Z' ),
+		'event'     => 'canceled',
+		'draft_id'  => $draft_id,
+		'target_id' => $target_id ? $target_id : null,
+	) );
+
+	return array(
+		'canceled'    => true,
+		'draft_id'    => $draft_id,
+		'target_id'   => $target_id ? $target_id : null,
+		'copy_status' => get_post_status( $draft_id ),
+		'note'        => 'The _dp_original link is intact — reschedule with schedule-republish at any time.',
+	);
+}
+
+/* ---- Daily sweep: a missed cron leaves a copy stuck in `future` forever ---- */
+
+add_action( 'init', 'sitebridge_republish_schedule_sweep' );
+function sitebridge_republish_schedule_sweep() {
+	if ( ! wp_next_scheduled( 'sitebridge_republish_sweep' ) ) {
+		wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', 'sitebridge_republish_sweep' );
+	}
+}
+
+add_action( 'sitebridge_republish_sweep', 'sitebridge_republish_sweep_run' );
+function sitebridge_republish_sweep_run() {
+	if ( ! sitebridge_republish_dp_active() ) {
+		return;
+	}
+	$stuck = get_posts( array(
+		'post_type'   => 'any',
+		'post_status' => 'future',
+		'numberposts' => 50,
+		'meta_key'    => '_dp_is_rewrite_republish_copy',
+		'meta_value'  => 1,
+	) );
+	$grace = 15 * MINUTE_IN_SECONDS;
+	foreach ( $stuck as $c ) {
+		$ts = ( $c->post_date_gmt && $c->post_date_gmt !== '0000-00-00 00:00:00' )
+			? strtotime( $c->post_date_gmt . ' UTC' )
+			: false;
+		if ( ! $ts || $ts > ( time() - $grace ) ) {
+			continue;
+		}
+		sitebridge_republish_log_append( array(
+			'time'              => gmdate( 'Y-m-d\TH:i:s\Z' ),
+			'event'             => 'sweep_republish',
+			'draft_id'          => $c->ID,
+			'target_id'         => (int) get_post_meta( $c->ID, '_dp_original', true ),
+			'scheduled_for_utc' => str_replace( ' ', 'T', $c->post_date_gmt ) . 'Z',
+		) );
+		// Same code path core cron runs: publish the copy → future_to_publish →
+		// Duplicate Post merges it into the original and deletes the copy.
+		check_and_publish_future_post( $c->ID );
+	}
+}
+
+register_deactivation_hook( __FILE__, function () {
+	wp_clear_scheduled_hook( 'sitebridge_republish_sweep' );
+} );
 
 /* ---- Admin page: Redirects dashboard (so humans can manage them too) ------- */
 
