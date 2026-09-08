@@ -50,6 +50,7 @@ function add_filter( ...$a ) {}
 function remove_filter( ...$a ) {}
 function register_rest_route( ...$a ) {}
 function register_activation_hook( ...$a ) {}
+function register_deactivation_hook( ...$a ) {}
 function plugin_basename( $f ) { return basename( $f ); }
 function plugin_dir_path( $f ) { return dirname( $f ) . '/'; }
 function plugin_dir_url( $f ) { return ''; }

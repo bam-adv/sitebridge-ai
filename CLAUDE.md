@@ -1,10 +1,11 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.18.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.19.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
-writes**, **read-only capability findings** (site viability discovery). Self-updates from GitHub releases. Host- and site-agnostic by design.
+writes**, **read-only capability findings** (site viability discovery), **scheduled republish**
+(Duplicate Post rewrite-copy staging with publish-date preservation). Self-updates from GitHub releases. Host- and site-agnostic by design.
 
 ## Where this sits (3 layers — don't conflate them)
 
@@ -30,7 +31,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.18.0)
+## REST surface (v1.19.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -133,6 +134,41 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   throttle would itself write). Sections run in individual try/catch under a 50s deadline —
   failures land in `collection_status.failed_sections`, the run still returns.
 
+- **Scheduled republish** (v1.19+, `sitebridge/v1` namespace): `POST /schedule-republish`,
+  `GET /scheduled-republishes`, `DELETE /scheduled-republish/{draft_id}` — stages an existing
+  plain staging draft as a **Yoast Duplicate Post** Rewrite & Republish copy of a live post and
+  schedules the merge (live URL never goes dark; same post ID/slug/permalink/comments after).
+  All DP integration verified against the **4.7 source**: copy meta `_dp_original`,
+  `_dp_is_rewrite_republish_copy`, `_dp_creation_date_gmt`; original meta
+  `_dp_has_rewrite_republish_copy` (copy ID); merge = `future_to_publish` →
+  `Post_Republisher::republish_scheduled_post` → fires `duplicate_post_after_republish` (4.6+)
+  → deletes the copy unconditionally (hence `delete_copy_after:false` is refused, 400).
+  **The re-dating trap**: DP's merge clones the copy's row — future `post_date` included — onto
+  the original, so the module stashes the original's dates on the copy
+  (`_sitebridge_restore_post_date{,_gmt}`) and restores them in a
+  `duplicate_post_after_republish` hook via **direct `$wpdb->update` on the two date columns**
+  (NOT `wp_update_post` — that would round-trip `post_content` through the ACF-block-JSON
+  re-normalization and touch `post_modified`, which must stay at merge time so `dateModified`
+  moves while `datePublished` doesn't). `preserve_publish_date` defaults **true**; re-dating is
+  explicit opt-in. The same hook copies the three Yoast keys explicitly
+  (belt-and-braces — 4.7's merge copies all copy meta itself with `use_filters=false`), fires
+  the standard cache purge for the target URL (`sitebridge_purge_cache_run()`, extracted from
+  the purge route in v1.19), and appends to a capped 50-entry option log
+  (`sitebridge_republish_log`) that `GET /scheduled-republishes` returns — how a later session
+  confirms a queued batch shipped. The hook is **gated on `_sitebridge_republish_scheduled`**,
+  so manual Duplicate Post use is untouched. Preflights (all before any write): draft is
+  `draft` (or a sitebridge copy of the same target → reschedule in one call), target is
+  `publish`, same post type, `publish_at` future (site tz default, IANA opt-in), draft not
+  linked elsewhere, one pending copy per target. Cancel = copy back to `draft`, `_dp_original`
+  kept, cron event cleared. A **daily sweep** (`sitebridge_republish_sweep`) republishes any
+  copy stuck in `future` >15 min past due via `check_and_publish_future_post()` (the normal
+  cron path) and logs it. **Taxonomy wipe defense** (a gap the build spec missed): DP's merge
+  sets the original's terms to the COPY's terms for every taxonomy (category cleared first) —
+  a genuine DP clone carries the original's terms, but our staging drafts are fresh posts, so
+  scheduling mirrors the target's terms onto any taxonomy where the draft has none (only the
+  auto-assigned default category counts as none; deliberately chosen draft terms win). Reported
+  as `taxonomies_mirrored` in the schedule response.
+
 Site-/theme-specific tailoring is centralized in the **CONFIG/PROFILE** block at the top of the
 file, overridable via `wp-config` constants / filters. Keep new tailoring there, not scattered
 through the code.
@@ -160,6 +196,16 @@ false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 `function_exists()`/`defined()` state (present/connected, disconnected, API-throws, legacy
 `nitropack_purge()`, absent). The absent scenario doubles as the no-behavior-change check for
 non-NitroPack hosts (WP Engine sites must return byte-identical purge responses).
+
+`php tests/republish-acceptance.php` — 71 assertions over the scheduled-republish module, two
+subprocess scenarios (main, no-Duplicate-Post). The stub carries a real add_action/do_action
+dispatcher plus a mini-emulation of DP 4.7's scheduled-republish flow that faithfully reproduces
+the re-dating trap (the merge clones the copy's dates onto the original), so the date restore is
+asserted against the actual clobber. Covers every preflight, schedule/reschedule/cancel, the
+merge (content swapped, slug/ID/publish-date kept, modified moved, Yoast landed, copy deleted,
+log written), the opt-in re-dating path, list + past_due, and the sweep. Its live assumptions
+(DP 4.7 meta keys and hook order) were read from the 4.7 source 2026-09-08; the spec's live
+acceptance pass on one real post is still the release gate.
 
 `php tests/capability-acceptance.php` — 96 assertions over the capability-findings route, five
 subprocess scenarios (profile-a-shaped, no-ACF, builder, schema-fetch fallback, section failure).
