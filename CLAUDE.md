@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.19.1**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.19.2**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -31,7 +31,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.19.1)
+## REST surface (v1.19.2 — unchanged since v1.19.1)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -233,6 +233,13 @@ release acceptance pass.
 `pre_set_site_transient_update_plugins` → polls `api.github.com/repos/{SITEBRIDGE_GH_REPO}/releases/latest`,
 offers the release's `.zip` asset, renames the unpacked `repo-tag/` dir to the plugin slug.
 `SITEBRIDGE_GH_REPO = 'bam-adv/sitebridge-ai'`. Runs for manual AND background auto-updates.
+
+The release lookup is cached 6 hours (`sitebridge_latest_release` transient). **v1.19.2**: a
+signature refusal deletes that transient, so once the operator publishes a corrected release
+the next update check re-polls GitHub fresh — the admin notice's "confirm the release .zip is
+signed, then retry" actually works. Before this, a retry kept hitting the cached (broken)
+release listing for up to 6 hours (bit culliganla.com during the 2026-09-09 v1.19.0→v1.19.1
+incident). No test touches the updater yet; if one ever does, cover this cache-bust.
 
 ### Signed releases (required since v1.11.0)
 
