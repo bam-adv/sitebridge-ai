@@ -1,6 +1,6 @@
 <?php
 /**
- * Acceptance harness for the SCHEDULED REPUBLISH module (v1.19.0).
+ * Acceptance harness for the SCHEDULED REPUBLISH module (v1.19.1).
  *
  * No WordPress, no PHPUnit, no network: stubs a posts/meta/options/cron store,
  * a real add_action/do_action dispatcher, and — critically — a mini-emulation
@@ -230,23 +230,47 @@ function wp_clear_scheduled_hook( $hook, $args = array() ) {
 
 // ---------------------------------------------------------- post updating ---
 // Mirrors the slices of wp_update_post()/core the module relies on: field
-// merge, post_modified refresh, and _transition_post_status scheduling the
-// publish_future_post single event when a post becomes `future`.
+// merge, post_modified refresh, _transition_post_status scheduling the
+// publish_future_post single event when a post lands in `future` — and the two
+// core date rules whose absence hid the v1.19.0 scheduling bug:
+//   1. wp_update_post() DISCARDS the dates passed for a never-published draft
+//      (post_date_gmt 0000-00-00) unless edit_date is passed ("Drafts
+//      shouldn't be assigned a date unless explicitly done so by the user")
+//      and substitutes the current time;
+//   2. wp_insert_post() demotes `future` straight to `publish` when the
+//      resolved post_date_gmt is not past the current minute's end (now:59).
+// $GLOBALS['sb_force_demote'] emulates a third-party save hook demoting the
+// copy regardless of date — for the endpoint's rollback hardening test.
 function wp_update_post( $arr, $wp_error = false ) {
 	$id = (int) $arr['ID'];
 	if ( ! isset( $GLOBALS['sb_posts'][ $id ] ) ) {
 		return $wp_error ? new WP_Error( 'invalid_post', 'Invalid post ID.' ) : 0;
 	}
 	$p = $GLOBALS['sb_posts'][ $id ];
+	if ( in_array( $p->post_status, array( 'draft', 'pending', 'auto-draft' ), true )
+		&& empty( $arr['edit_date'] ) && $p->post_date_gmt === '0000-00-00 00:00:00' ) {
+		$arr['post_date']     = ( new DateTimeImmutable( 'now', wp_timezone() ) )->format( 'Y-m-d H:i:s' );
+		$arr['post_date_gmt'] = '';
+	}
 	foreach ( array( 'post_status', 'post_title', 'post_content', 'post_name', 'post_date', 'post_date_gmt' ) as $f ) {
 		if ( array_key_exists( $f, $arr ) ) {
 			$p->$f = $arr[ $f ];
 		}
 	}
+	if ( ( $p->post_date_gmt === '' || $p->post_date_gmt === '0000-00-00 00:00:00' )
+		&& ! in_array( $p->post_status, array( 'draft', 'pending', 'auto-draft' ), true ) ) {
+		$p->post_date_gmt = ( new DateTimeImmutable( $p->post_date, wp_timezone() ) )
+			->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' );
+	}
+	if ( $p->post_status === 'future'
+		&& ( ! empty( $GLOBALS['sb_force_demote'] )
+			|| strtotime( $p->post_date_gmt . ' UTC' ) <= strtotime( gmdate( 'Y-m-d H:i:59' ) . ' UTC' ) ) ) {
+		$p->post_status = 'publish';
+	}
 	$p->post_modified     = gmdate( 'Y-m-d H:i:s', time() + wp_timezone()->getOffset( new DateTime( 'now' ) ) );
 	$p->post_modified_gmt = gmdate( 'Y-m-d H:i:s' );
-	if ( isset( $arr['post_status'] ) && $arr['post_status'] === 'future' ) {
-		wp_clear_scheduled_hook( 'publish_future_post', array( $id ) );
+	wp_clear_scheduled_hook( 'publish_future_post', array( $id ) );
+	if ( $p->post_status === 'future' ) {
 		wp_schedule_single_event( strtotime( $p->post_date_gmt . ' UTC' ), 'publish_future_post', array( $id ) );
 	}
 	return $id;
@@ -411,7 +435,10 @@ sb_add_post( array(
 	'ID' => 4489, 'post_type' => 'post', 'post_status' => 'draft',
 	'post_title' => 'New Title', 'post_content' => '<p>new body</p>',
 	'post_name' => 'staging-draft-4489',
-	'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => gmdate( 'Y-m-d H:i:s' ),
+	// A never-published draft has a FLOATING date: post_date_gmt is zero. This
+	// is what a real create_post staging draft looks like, and what trips
+	// core's clear_date rule if the module forgets edit_date (the v1.19.0 bug).
+	'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => '0000-00-00 00:00:00',
 	'post_modified' => gmdate( 'Y-m-d H:i:s' ), 'post_modified_gmt' => gmdate( 'Y-m-d H:i:s' ),
 ) );
 update_post_meta( 4489, '_yoast_wpseo_title', 'New SEO Title' );
@@ -426,6 +453,22 @@ wp_set_object_terms( 4489, array( 1 ), 'category' );
 $future_local = new DateTimeImmutable( '+7 days 09:00', wp_timezone() );
 $publish_at   = $future_local->format( 'Y-m-d\TH:i:s' );
 
+section( 'stub fidelity: core clears a floating draft date without edit_date' );
+// The v1.19.0 bug, demonstrated directly: scheduling a never-published draft
+// WITHOUT edit_date makes core discard the dates, substitute "now", and demote
+// future→publish on the spot. The module must never take this path again.
+sb_add_post( array( 'ID' => 8000, 'post_type' => 'post', 'post_status' => 'draft', 'post_title' => 'floating', 'post_content' => '', 'post_name' => 'floating', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => '0000-00-00 00:00:00', 'post_modified' => '', 'post_modified_gmt' => '' ) );
+wp_update_post( array(
+	'ID'            => 8000,
+	'post_status'   => 'future',
+	'post_date'     => $future_local->format( 'Y-m-d H:i:s' ),
+	'post_date_gmt' => $future_local->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' ),
+) );
+ok( get_post( 8000 )->post_status === 'publish', 'without edit_date the copy publishes IMMEDIATELY (the v1.19.0 bug)' );
+ok( abs( strtotime( get_post( 8000 )->post_date_gmt . ' UTC' ) - time() ) < 60, 'and its date is reset to "now", not the requested time' );
+ok( wp_next_scheduled( 'publish_future_post', array( 8000 ) ) === false, 'and no cron event exists' );
+sb_delete_post( 8000 );
+
 section( 'preflight validation (nothing may be written on failure)' );
 $r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 4489, 'target_id' => 3571, 'publish_at' => $publish_at, 'delete_copy_after' => false ) ) );
 ok( err_code( $r ) === 'unsupported_option', 'delete_copy_after:false is refused (DP always deletes the copy)' );
@@ -437,7 +480,7 @@ $r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 4489, 'target
 ok( err_code( $r ) === 'target_not_found', 'missing target → target_not_found' );
 $r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 3571, 'target_id' => 4489, 'publish_at' => $publish_at ) ) );
 ok( err_code( $r ) === 'target_not_published', 'draft as target → target_not_published' );
-sb_add_post( array( 'ID' => 77, 'post_type' => 'page', 'post_status' => 'draft', 'post_title' => 'x', 'post_content' => '', 'post_name' => 'x', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => gmdate( 'Y-m-d H:i:s' ), 'post_modified' => '', 'post_modified_gmt' => '' ) );
+sb_add_post( array( 'ID' => 77, 'post_type' => 'page', 'post_status' => 'draft', 'post_title' => 'x', 'post_content' => '', 'post_name' => 'x', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => '0000-00-00 00:00:00', 'post_modified' => '', 'post_modified_gmt' => '' ) );
 $r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 77, 'target_id' => 3571, 'publish_at' => $publish_at ) ) );
 ok( err_code( $r ) === 'post_type_mismatch', 'page draft vs post target → post_type_mismatch' );
 $r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 4489, 'target_id' => 3571, 'publish_at' => $publish_at, 'timezone' => 'Mars/Olympus' ) ) );
@@ -460,6 +503,8 @@ ok( $r['target_url'] === 'https://example.com/blog/what-is-the-life-expectancy-o
 $expected_utc = $future_local->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d\TH:i:s' ) . 'Z';
 ok( $r['publish_at_utc'] === $expected_utc, "site-time publish_at converted to UTC ($expected_utc)" );
 ok( $r['cron_event_utc'] === $expected_utc, 'publish_future_post cron event confirmed at that time' );
+ok( get_post( 4489 )->post_status === 'future', 'copy is `future` in the store, not just in the response' );
+ok( get_post( 4489 )->post_date_gmt === $future_local->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' ), 'copy post_date_gmt is the REQUESTED time — edit_date kept core from clearing the floating draft date (v1.19.1 regression)' );
 ok( (int) get_post_meta( 4489, '_dp_is_rewrite_republish_copy', true ) === 1, 'copy marked _dp_is_rewrite_republish_copy' );
 ok( (int) get_post_meta( 4489, '_dp_original', true ) === 3571, 'copy linked via _dp_original' );
 ok( get_post_meta( 4489, '_dp_creation_date_gmt', true ) !== '', 'copy carries _dp_creation_date_gmt' );
@@ -471,7 +516,7 @@ $t = get_post( 3571 );
 ok( $t->post_status === 'publish' && $t->post_content === '<p>old body</p>' && $t->post_date === '2025-03-11 14:22:09', 'original is untouched at schedule time (stays live with OLD content)' );
 
 section( 'conflicts while scheduled' );
-sb_add_post( array( 'ID' => 5000, 'post_type' => 'post', 'post_status' => 'draft', 'post_title' => 'other', 'post_content' => '', 'post_name' => 'other', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => gmdate( 'Y-m-d H:i:s' ), 'post_modified' => '', 'post_modified_gmt' => '' ) );
+sb_add_post( array( 'ID' => 5000, 'post_type' => 'post', 'post_status' => 'draft', 'post_title' => 'other', 'post_content' => '', 'post_name' => 'other', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => '0000-00-00 00:00:00', 'post_modified' => '', 'post_modified_gmt' => '' ) );
 $r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 5000, 'target_id' => 3571, 'publish_at' => $publish_at ) ) );
 ok( err_code( $r ) === 'target_has_pending_copy', 'second draft against same target → target_has_pending_copy' );
 sb_add_post( array( 'ID' => 6000, 'post_type' => 'post', 'post_status' => 'publish', 'post_title' => 'other live', 'post_content' => '', 'post_name' => 'other-live', 'post_date' => '2024-01-01 00:00:00', 'post_date_gmt' => '2024-01-01 08:00:00', 'post_modified' => '', 'post_modified_gmt' => '' ) );
@@ -524,7 +569,7 @@ ok( $merged[0]['url'] === 'https://example.com/blog/what-is-the-life-expectancy-
 ok( array_key_exists( 'cache_purge_fired', $merged[0] ), 'log records the cache purge attempt' );
 
 section( 'opt-in re-dating: preserve_publish_date false (+ copy_yoast_meta false)' );
-sb_add_post( array( 'ID' => 5001, 'post_type' => 'post', 'post_status' => 'draft', 'post_title' => 'Redate New', 'post_content' => '<p>redate</p>', 'post_name' => 'redate-draft', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => gmdate( 'Y-m-d H:i:s' ), 'post_modified' => '', 'post_modified_gmt' => '' ) );
+sb_add_post( array( 'ID' => 5001, 'post_type' => 'post', 'post_status' => 'draft', 'post_title' => 'Redate New', 'post_content' => '<p>redate</p>', 'post_name' => 'redate-draft', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => '0000-00-00 00:00:00', 'post_modified' => '', 'post_modified_gmt' => '' ) );
 wp_set_object_terms( 5001, array( 12 ), 'category' ); // deliberately chosen — must NOT be overwritten
 wp_set_object_terms( 6000, array( 5 ), 'category' );
 $r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 5001, 'target_id' => 6000, 'publish_at' => $publish_at, 'preserve_publish_date' => false, 'copy_yoast_meta' => false ) ) );
@@ -545,7 +590,7 @@ ok( $last['event'] === 'merged' && $last['publish_date_preserved'] === 'off', 'l
 ok( $last['yoast_meta_copied'] === array(), 'no explicit Yoast copy when copy_yoast_meta false' );
 
 section( 'cancel' );
-sb_add_post( array( 'ID' => 5002, 'post_type' => 'post', 'post_status' => 'draft', 'post_title' => 'Cancel Me', 'post_content' => '<p>x</p>', 'post_name' => 'cancel-draft', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => gmdate( 'Y-m-d H:i:s' ), 'post_modified' => '', 'post_modified_gmt' => '' ) );
+sb_add_post( array( 'ID' => 5002, 'post_type' => 'post', 'post_status' => 'draft', 'post_title' => 'Cancel Me', 'post_content' => '<p>x</p>', 'post_name' => 'cancel-draft', 'post_date' => gmdate( 'Y-m-d H:i:s' ), 'post_date_gmt' => '0000-00-00 00:00:00', 'post_modified' => '', 'post_modified_gmt' => '' ) );
 sb_add_post( array( 'ID' => 6001, 'post_type' => 'post', 'post_status' => 'publish', 'post_title' => 'Cancel Target', 'post_content' => '<p>y</p>', 'post_name' => 'cancel-target', 'post_date' => '2024-06-01 10:00:00', 'post_date_gmt' => '2024-06-01 17:00:00', 'post_modified' => '', 'post_modified_gmt' => '' ) );
 $r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 5002, 'target_id' => 6001, 'publish_at' => $publish_at ) ) );
 ok( ! is_wp_error( $r ), 'scheduled the cancel candidate' );
@@ -575,6 +620,21 @@ ok( get_post( 6001 )->post_date_gmt === '2024-06-01 17:00:00', 'sweep merge also
 $log    = get_option( 'sitebridge_republish_log' );
 $sweeps = array_values( array_filter( (array) $log, function ( $e ) { return $e['event'] === 'sweep_republish'; } ) );
 ok( count( $sweeps ) === 1 && $sweeps[0]['draft_id'] === 5002, 'sweep logged' );
+
+section( 'hardening: a copy that does not land in `future` is rolled back' );
+// Emulates any save hook (core's own demotion included) publishing the copy
+// during the scheduling write. The endpoint must fail loudly, stage nothing,
+// and leave no live duplicate URL behind — never report scheduled:true.
+$GLOBALS['sb_force_demote'] = true;
+$r = sitebridge_schedule_republish_rest( req( array( 'draft_id' => 5000, 'target_id' => 3571, 'publish_at' => $publish_at ) ) );
+$GLOBALS['sb_force_demote'] = false;
+ok( err_code( $r ) === 'schedule_not_future', 'demoted copy → schedule_not_future, not scheduled:true' );
+ok( is_wp_error( $r ) && $r->data['status'] === 500, 'and a 500' );
+ok( get_post( 5000 )->post_status === 'draft', 'copy rolled back to draft (no live duplicate URL)' );
+ok( wp_next_scheduled( 'publish_future_post', array( 5000 ) ) === false, 'no cron event left behind' );
+ok( get_post_meta( 5000, '_dp_original', true ) === '' && get_post_meta( 3571, '_dp_has_rewrite_republish_copy', true ) === '', 'no DP meta staged on either post' );
+$l = sitebridge_list_republishes_rest( req( array() ) );
+ok( $l['count'] === 0, 'nothing queued after the rollback' );
 
 echo "\n$pass passed, $fail failed\n";
 exit( $fail ? 1 : 0 );
