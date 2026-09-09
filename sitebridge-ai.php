@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.19.1
+ * Version:     1.19.2
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.19.1' );
+define( 'SITEBRIDGE_VERSION', '1.19.2' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -182,6 +182,11 @@ function sitebridge_verify_before_download( $reply, $package, $upgrader, $hook_e
 	$refuse = function ( $why ) {
 		error_log( 'SiteBridge AI: update refused — ' . $why );
 		set_transient( 'sitebridge_update_sig_error', $why, DAY_IN_SECONDS );
+		// Bust the 6-hour release cache: the refusal usually means the release
+		// itself is bad (missing/unsigned asset), and the operator's fix — a
+		// corrected release on GitHub — must be visible on the next check, not
+		// after the cache expires (bit culliganla.com in the v1.19.0 incident).
+		delete_transient( 'sitebridge_latest_release' );
 		return new WP_Error( 'sitebridge_bad_signature', 'SiteBridge AI update refused: ' . $why );
 	};
 
