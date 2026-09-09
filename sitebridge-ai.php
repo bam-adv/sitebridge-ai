@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.19.0
+ * Version:     1.19.1
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.19.0' );
+define( 'SITEBRIDGE_VERSION', '1.19.1' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -2527,14 +2527,35 @@ function sitebridge_schedule_republish_rest( WP_REST_Request $req ) {
 	// Schedule the copy first: the one write that can realistically fail, so a
 	// failure here leaves nothing half-staged. Core's _transition_post_status
 	// schedules the publish_future_post cron event off this same update.
+	// edit_date is REQUIRED: a never-published draft has a floating date
+	// (post_date_gmt 0000-00-00), and without edit_date wp_update_post()
+	// silently discards the dates passed here ("Drafts shouldn't be assigned
+	// a date unless explicitly done so by the user"), substitutes "now", and
+	// core then demotes future→publish on the spot — the copy goes live as a
+	// duplicate URL immediately and nothing ever fires.
 	$updated = wp_update_post( array(
 		'ID'            => $draft_id,
 		'post_status'   => 'future',
 		'post_date'     => $post_date,
 		'post_date_gmt' => $post_date_gmt,
+		'edit_date'     => true,
 	), true );
 	if ( is_wp_error( $updated ) ) {
 		return new WP_Error( 'schedule_failed', sprintf( 'Could not schedule draft #%d: %s', $draft_id, $updated->get_error_message() ), array( 'status' => 500 ) );
+	}
+
+	// Never report scheduled:true unless the copy actually landed in `future` —
+	// core (or another plugin's save hook) can demote it straight to publish,
+	// and a published copy is a live duplicate-content URL. Roll back and fail.
+	$landed_status = get_post_status( $draft_id );
+	if ( $landed_status !== 'future' ) {
+		wp_update_post( array( 'ID' => $draft_id, 'post_status' => 'draft' ) );
+		wp_clear_scheduled_hook( 'publish_future_post', array( $draft_id ) );
+		return new WP_Error(
+			'schedule_not_future',
+			sprintf( 'Draft #%d ended up status "%s" instead of "future" after the scheduling write — rolled back to draft, nothing is scheduled or staged.', $draft_id, $landed_status ?: 'deleted' ),
+			array( 'status' => 500 )
+		);
 	}
 
 	// Duplicate Post staging meta (keys verified against the 4.7 source).

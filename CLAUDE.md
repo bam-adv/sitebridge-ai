@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.19.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.19.1**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -31,7 +31,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.19.0)
+## REST surface (v1.19.1)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -168,6 +168,16 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   scheduling mirrors the target's terms onto any taxonomy where the draft has none (only the
   auto-assigned default category counts as none; deliberately chosen draft terms win). Reported
   as `taxonomies_mirrored` in the schedule response.
+  **v1.19.1** — the scheduling write now passes **`edit_date => true`**: without it, core's
+  `wp_update_post()` discards the dates on a never-published draft (floating
+  `post_date_gmt 0000-00-00` — "Drafts shouldn't be assigned a date unless explicitly done so by
+  the user"), substitutes "now", and then demotes `future`→`publish` immediately — the copy went
+  publicly live at its own URL with no cron event and invisible to the list route (the v1.19.0
+  live-acceptance failure on culliganla.com, 2026-09-08). Hardening: after the scheduling write
+  the endpoint verifies the copy actually landed in `future`; anything else (any plugin's save
+  hook can demote) is rolled back to `draft`, cron cleared, and returned as `schedule_not_future`
+  (500) **before** any DP/staging meta is written — `scheduled:true` now guarantees a live
+  `future` copy.
 
 Site-/theme-specific tailoring is centralized in the **CONFIG/PROFILE** block at the top of the
 file, overridable via `wp-config` constants / filters. Keep new tailoring there, not scattered
@@ -197,15 +207,20 @@ false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 `nitropack_purge()`, absent). The absent scenario doubles as the no-behavior-change check for
 non-NitroPack hosts (WP Engine sites must return byte-identical purge responses).
 
-`php tests/republish-acceptance.php` — 71 assertions over the scheduled-republish module, two
+`php tests/republish-acceptance.php` — 82 assertions over the scheduled-republish module, two
 subprocess scenarios (main, no-Duplicate-Post). The stub carries a real add_action/do_action
 dispatcher plus a mini-emulation of DP 4.7's scheduled-republish flow that faithfully reproduces
 the re-dating trap (the merge clones the copy's dates onto the original), so the date restore is
-asserted against the actual clobber. Covers every preflight, schedule/reschedule/cancel, the
-merge (content swapped, slug/ID/publish-date kept, modified moved, Yoast landed, copy deleted,
-log written), the opt-in re-dating path, list + past_due, and the sweep. Its live assumptions
-(DP 4.7 meta keys and hook order) were read from the 4.7 source 2026-09-08; the spec's live
-acceptance pass on one real post is still the release gate.
+asserted against the actual clobber. Since v1.19.1 the `wp_update_post` stub also emulates the
+two core date rules that hid the v1.19.0 scheduling bug — floating-date drafts have their dates
+cleared unless `edit_date` is passed, and a `future` post whose date isn't past "now:59" is
+demoted straight to `publish` — and the draft fixtures carry the realistic
+`post_date_gmt 0000-00-00` a never-published `create_post` draft actually has. Covers every
+preflight, schedule/reschedule/cancel, the merge (content swapped, slug/ID/publish-date kept,
+modified moved, Yoast landed, copy deleted, log written), the opt-in re-dating path, list +
+past_due, the sweep, and the v1.19.1 rollback hardening (a demoted copy → `schedule_not_future`,
+nothing staged). Its live assumptions (DP 4.7 meta keys and hook order) were read from the 4.7
+source 2026-09-08; the spec's live acceptance pass on one real post is still the release gate.
 
 `php tests/capability-acceptance.php` — 96 assertions over the capability-findings route, five
 subprocess scenarios (profile-a-shaped, no-ACF, builder, schema-fetch fallback, section failure).
