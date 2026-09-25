@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.19.2**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.20.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -31,7 +31,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.19.2 — unchanged since v1.19.1)
+## REST surface (v1.20.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -70,6 +70,17 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   `dry_run` (default true). Per-pair `expect` mismatch aborts the WHOLE request (returned as HTTP 200
   with `aborted:true` so the connector surfaces the per-pair `found` counts). Guards: `old` ≥ 8 bytes,
   `old !== new`, ≤ 20 pairs. Returns `md5`/`bytes` before & after (no revision entry is created).
+  **v1.20** — per-pair **`occurrence`** (1-based): replace only the Nth non-overlapping match
+  (same walk as `substr_count`), indexed against the working buffer at that pair's turn. Composes
+  with `expect` (which still asserts the TOTAL count); `occurrence` > found aborts the whole request
+  like an `expect` mismatch (`reason:"occurrence_out_of_range"`, pair flagged, nothing written);
+  non-integer / < 1 → 400 `bad_occurrence`. Every pair row now echoes `occurrence` (null when
+  omitted) — the connector uses the key's presence to refuse `occurrence` against older plugins,
+  which would silently replace ALL. Omitting it is byte-identical to before.
+  **Escapes are NOT decoded here, and never were** (2026-09-25 trace): matching is byte-exact
+  against the stored `\u003c`/`\r\n` bytes. The observed "decoding" happens in the MCP client's tool-call
+  layer, which rewrites `\uXXXX` in tool arguments before they reach the connector (it leaves
+  `\r\n` alone). The connector's `escape:"block_json"` mode is the answer to that, not a plugin change.
 - **Yoast meta** (v1.13+, extended v1.15): `POST /yoast-meta` — writes `_yoast_wpseo_canonical` and
   `_yoast_wpseo_meta-robots-noindex` via `update_post_meta`/`delete_post_meta` (these two keys aren't
   dependably core-REST-writable). `canonical:""` clears; robots `index|noindex|default` maps to
@@ -109,6 +120,14 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   `SITEBRIDGE_HERO_BLOCK`/`SITEBRIDGE_HERO_TOGGLE`, defaults suit one common theme profile, '' disables): setting the
   toggle true on a post whose content carries the hero block → 409 `hero_conflict` (double
   render); setting it false is the sanctioned state on block pages.
+  **v1.20** — **block-level field guard**: a field whose group is located ONLY on blocks (every
+  location OR-branch has a `block ==` rule; sub-fields walk up via `parent`) is stored in the
+  block-comment JSON in `post_content`, not postmeta — `update_field()` used to write an orphan
+  meta row and report `reference_ok:true` with the page unchanged. Now refused in preflight: 409
+  `block_level_field` naming the group/blocks and pointing at `search_replace_content`; nothing is
+  written (all-or-nothing, like unknown selectors). Mixed-location groups (block OR page) and
+  undeterminable groups keep the old behavior. Writing block attributes for real (parse block
+  JSON, re-serialize with the exact escaping) is scoped separately.
 - **Cache purge** (v1.15+): `POST /purge-cache` — optional `url` (path or absolute; per-URL purge
   where the engine supports it) and/or `post_id` (resolves permalink + `clean_post_cache`); neither
   = full-site purge. Detects and fires: WP Engine, Kinsta, W3TC, WP Rocket, WP Super Cache,
@@ -191,16 +210,25 @@ of untouched siblings, the add/remove round-trip, and regressions on remove-link
 nav change. It does NOT replace a live pass on staging — real ACF serialization and the theme's
 render are out of its reach.
 
-`php tests/acf-fields-acceptance.php` — 54 assertions over the `/acf-fields` route with an ACF
+`php tests/acf-fields-acceptance.php` — 65 assertions over the `/acf-fields` route with an ACF
 storage emulation faithful to real persistence (value rows, `_`-reference rows holding field
 keys, repeater count + `{name}_{i}_{sub}` rows, **and ACF's own shrink cleanup** — the stub
 deletes rows `[new..old)` for registered sub-fields, as `acf-field-repeater.php::delete_row`
 does, which is what makes the v1.17.1 counter behavior testable). Covers the five handoff
 acceptance criteria in logic form, reference-row repair (healed + skipped), the hero guard,
 all-or-nothing input validation, null normalization, and the stale-row sweep (orphans ACF can't
-see, the same-prefix sibling field it must not touch, `clear_stale_rows:false`). Its live
+see, the same-prefix sibling field it must not touch, `clear_stale_rows:false`), and the v1.20
+block-level guard (block sub-field + repeater refused with zero meta writes, all-or-nothing,
+page-level and mixed-location groups still writable). Its live
 assumptions (sub-field keys resolve individually via `acf_get_field()`; composite keys return
 false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
+
+`php tests/search-replace-acceptance.php` — 25 assertions over `/search-replace` with a one-row
+`$wpdb` and a real ACF-block-JSON fixture (built with `chr(92)` so no tool in the authoring chain
+can decode its escapes — see the v1.20 note above; the same client-side decoding bit this very
+file while it was being written). Covers byte-exact escape matching + the 40-byte round trip,
+`occurrence` (middle-of-3, sequential indexing, out-of-range abort with zero writes, validation,
+composition with `expect`), and the no-`occurrence` regression.
 
 `php tests/purge-acceptance.php` — the purge route's NitroPack branch, one subprocess per
 `function_exists()`/`defined()` state (present/connected, disconnected, API-throws, legacy

@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.19.2
+ * Version:     1.20.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.19.2' );
+define( 'SITEBRIDGE_VERSION', '1.20.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -1486,8 +1486,8 @@ add_action( 'rest_api_init', function () {
  *
  * The whole reason this exists: editing an href inside ACF block-comment JSON
  * via update_post / wp_update_post() round-trips post_content through
- * wp_slash()/kses, which re-normalizes the unicode escapes ACF stores ( ",
- * <, \r\n, … ). That silently strips block attributes and blanks live
+ * wp_slash()/kses, which re-normalizes the unicode escapes ACF stores ( \u0022,
+ * \u003c, \r\n, … ). That silently strips block attributes and blanks live
  * sections (the "v1.1 blank-section trap"). So here we:
  *   1. read post_content straight from the DB (no the_content, no client copy),
  *   2. str_replace() each { old, new } pair sequentially on the raw bytes,
@@ -1499,6 +1499,16 @@ add_action( 'rest_api_init', function () {
  * literal multibyte needle (e.g. U+202F narrow no-break space) matches the exact
  * bytes stored in the row. Trade-off: no revision entry — the response returns
  * md5/byte counts before & after so the change stays reconstructable.
+ *
+ * OCCURRENCE (v1.20): a pair may carry `occurrence` (1-based) to replace only
+ * the Nth match instead of all of them — the only way to fix one of several
+ * identical windows without collateral edits. It indexes the working buffer at
+ * that pair's turn (earlier pairs already applied), counting non-overlapping
+ * matches left to right, exactly as substr_count() does. `expect` still asserts
+ * the TOTAL match count; an `occurrence` beyond it aborts the whole request the
+ * same way an `expect` mismatch does. Every pair row echoes `occurrence` (null
+ * when omitted) so the connector can tell this plugin from one that would
+ * silently ignore the key and replace all.
  */
 function sitebridge_search_replace_rest( WP_REST_Request $req ) {
 	global $wpdb;
@@ -1533,7 +1543,14 @@ function sitebridge_search_replace_rest( WP_REST_Request $req ) {
 			return new WP_Error( 'noop_pair', sprintf( 'replacements[%d].old === replacements[%d].new (no-op)', $idx, $idx ), array( 'status' => 400 ) );
 		}
 		$expect = ( isset( $r['expect'] ) && $r['expect'] !== null && $r['expect'] !== '' ) ? (int) $r['expect'] : null;
-		$pairs[] = array( 'old' => $old, 'new' => $new, 'expect' => $expect );
+		$occurrence = null;
+		if ( isset( $r['occurrence'] ) && $r['occurrence'] !== null && $r['occurrence'] !== '' ) {
+			$occurrence = filter_var( $r['occurrence'], FILTER_VALIDATE_INT );
+			if ( false === $occurrence || $occurrence < 1 ) {
+				return new WP_Error( 'bad_occurrence', sprintf( 'replacements[%d].occurrence must be an integer >= 1 (1 = first match)', $idx ), array( 'status' => 400 ) );
+			}
+		}
+		$pairs[] = array( 'old' => $old, 'new' => $new, 'expect' => $expect, 'occurrence' => $occurrence );
 	}
 
 	// Read raw content straight from the DB — no filters, no client-supplied copy.
@@ -1550,28 +1567,38 @@ function sitebridge_search_replace_rest( WP_REST_Request $req ) {
 	// buffer as we go. Enforce every `expect` before deciding to write anything.
 	$working  = $content;
 	$report   = array();
-	$mismatch = false;
+	$mismatch = null; // first abort reason, if any
 	foreach ( $pairs as $i => $p ) {
 		$found = substr_count( $working, $p['old'] );
 		$report[] = array(
 			'old_preview' => sitebridge_sr_preview( $p['old'] ),
 			'found'       => $found,
 			'expect'      => $p['expect'],
+			'occurrence'  => $p['occurrence'],
 			'replaced'    => 0,
 		);
 		if ( $p['expect'] !== null && $found !== $p['expect'] ) {
-			$mismatch = true;
+			$mismatch = $mismatch ? $mismatch : 'expect_mismatch';
 		}
-		if ( $found > 0 ) {
+		if ( $p['occurrence'] !== null ) {
+			if ( $p['occurrence'] > $found ) {
+				$report[ $i ]['occurrence_out_of_range'] = true;
+				$mismatch = $mismatch ? $mismatch : 'occurrence_out_of_range';
+				continue;
+			}
+			$working = sitebridge_sr_replace_nth( $working, $p['old'], $p['new'], $p['occurrence'] );
+			$report[ $i ]['replaced'] = 1;
+		} elseif ( $found > 0 ) {
 			$working             = str_replace( $p['old'], $p['new'], $working );
 			$report[ $i ]['replaced'] = $found;
 		}
 	}
 
-	// Any expect mismatch → abort the whole request, write nothing. Returned as
-	// HTTP 200 (not 4xx) on purpose: the connector surfaces the body verbatim, and
-	// the per-pair `found` counts are exactly what the caller needs to diagnose the
-	// mismatch. Callers must branch on `applied` / `aborted`, not on status code.
+	// Any expect mismatch / out-of-range occurrence → abort the whole request,
+	// write nothing. Returned as HTTP 200 (not 4xx) on purpose: the connector
+	// surfaces the body verbatim, and the per-pair `found` counts are exactly what
+	// the caller needs to diagnose the mismatch. Callers must branch on
+	// `applied` / `aborted`, not on status code.
 	if ( $mismatch ) {
 		foreach ( $report as &$row ) {
 			$row['replaced'] = 0; // nothing was applied
@@ -1582,7 +1609,10 @@ function sitebridge_search_replace_rest( WP_REST_Request $req ) {
 			'dry_run'      => $dry_run,
 			'applied'      => false,
 			'aborted'      => true,
-			'reason'       => 'expect_mismatch',
+			'reason'       => $mismatch,
+			'message'      => ( 'occurrence_out_of_range' === $mismatch )
+				? 'A pair\'s occurrence exceeds its match count (see pairs[].found / occurrence_out_of_range). Nothing was written.'
+				: 'A pair\'s match count differs from its expect (see pairs[].found). Nothing was written.',
 			'pairs'        => $report,
 			'md5_before'   => $md5_before,
 			'md5_after'    => $md5_before,
@@ -1621,6 +1651,22 @@ function sitebridge_search_replace_rest( WP_REST_Request $req ) {
 		'bytes_before' => $bytes_before,
 		'bytes_after'  => $bytes_after,
 	);
+}
+
+/**
+ * Replace only the $n-th (1-based) non-overlapping occurrence of $old — the same
+ * left-to-right, non-overlapping walk substr_count() uses, so `occurrence`
+ * always agrees with `found`. Caller guarantees 1 <= $n <= found.
+ */
+function sitebridge_sr_replace_nth( $haystack, $old, $new, $n ) {
+	$pos = -strlen( $old );
+	for ( $k = 0; $k < $n; $k++ ) {
+		$pos = strpos( $haystack, $old, $pos + strlen( $old ) );
+		if ( false === $pos ) {
+			return $haystack;
+		}
+	}
+	return substr_replace( $haystack, $new, $pos, strlen( $old ) );
 }
 
 /** Short, safe preview of an `old` needle for the response (first ~60 bytes). */
@@ -1867,6 +1913,24 @@ function sitebridge_acf_fields_rest( WP_REST_Request $req ) {
 				array( 'status' => 409 )
 			);
 		}
+		// A field whose group is located ONLY on blocks lives in the block
+		// comment JSON inside post_content, not in postmeta. update_field() would
+		// happily write an orphan meta row the block never reads — HTTP 200,
+		// reference_ok:true, page unchanged. Refuse before any write.
+		$block_group = sitebridge_acf_block_only_group( $field );
+		if ( $block_group ) {
+			return new WP_Error(
+				'block_level_field',
+				sprintf(
+					'"%s" (%s) belongs to field group "%s", which is located only on blocks (%s). Its value is stored in the block\'s attribute JSON inside post_content, not in page-level postmeta, so writing it here would change nothing on the page. Edit it with search_replace_content (targeting the block JSON) or in the block editor. Nothing was written.',
+					$selector,
+					$field['key'],
+					isset( $block_group['title'] ) ? $block_group['title'] : $block_group['key'],
+					implode( ', ', $block_group['_blocks'] )
+				),
+				array( 'status' => 409, 'field_key' => $field['key'], 'field_group' => $block_group['key'], 'blocks' => $block_group['_blocks'] )
+			);
+		}
 		// JSON null is not storable — normalize it to ACF's empty value before it
 		// can write a reference row the front end resolves to nothing.
 		$nulls = 0;
@@ -1957,6 +2021,48 @@ function sitebridge_acf_fields_rest( WP_REST_Request $req ) {
 		'content_md5_after'   => $md5_after,
 		'content_untouched'   => ( $md5_before === $md5_after ),
 	);
+}
+
+/**
+ * The field group a field belongs to, IF that group's location rules place it
+ * on blocks only (every OR-group carries a `block == …` rule) — i.e. its values
+ * are block attributes in post_content and never page-level postmeta. Returns
+ * the group with the matched block names in `_blocks`, or null (page-level,
+ * mixed-location, or undeterminable — the route's pre-v1.20 behavior).
+ * Sub-fields are walked up through their parent fields to the group.
+ */
+function sitebridge_acf_block_only_group( $field ) {
+	if ( ! function_exists( 'acf_get_field_group' ) ) {
+		return null;
+	}
+	$group  = null;
+	$parent = isset( $field['parent'] ) ? $field['parent'] : null;
+	for ( $depth = 0; $parent && $depth < 10; $depth++ ) {
+		$group = acf_get_field_group( $parent );
+		if ( $group ) {
+			break;
+		}
+		$up     = acf_get_field( $parent );
+		$parent = ( $up && isset( $up['parent'] ) ) ? $up['parent'] : null;
+	}
+	if ( empty( $group ) || empty( $group['location'] ) || ! is_array( $group['location'] ) ) {
+		return null;
+	}
+	$blocks = array();
+	foreach ( $group['location'] as $and_rules ) {
+		$has_block = false;
+		foreach ( (array) $and_rules as $rule ) {
+			if ( isset( $rule['param'], $rule['operator'] ) && 'block' === $rule['param'] && '==' === $rule['operator'] ) {
+				$has_block = true;
+				$blocks[]  = isset( $rule['value'] ) ? (string) $rule['value'] : 'block';
+			}
+		}
+		if ( ! $has_block ) {
+			return null; // this OR-branch targets something other than a block
+		}
+	}
+	$group['_blocks'] = array_values( array_unique( $blocks ) );
+	return $group;
 }
 
 /**
