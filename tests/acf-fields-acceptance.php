@@ -362,6 +362,45 @@ function update_field( $key, $value, $post_id = false ) {
 function get_field( $field, $post_id = false ) { return null; }
 function get_fields( $post_id = false ) { return array(); }
 
+// Field groups (v1.20 block-level guard). A page-level group located on a post
+// type, and a block-only group whose repeater sub-field is what Attempt B of
+// the 2026-09-25 handoff wrote to — its value lives in the block comment JSON.
+$GLOBALS['acf_groups'] = array(
+	'group_page_hero' => array(
+		'key' => 'group_page_hero', 'title' => 'Hero',
+		'location' => array( array( array( 'param' => 'post_type', 'operator' => '==', 'value' => 'page' ) ) ),
+	),
+	'group_block_cards' => array(
+		'key' => 'group_block_cards', 'title' => 'Contaminant Cards',
+		'location' => array( array( array( 'param' => 'block', 'operator' => '==', 'value' => 'acf/contaminant-cards' ) ) ),
+	),
+	'group_mixed' => array(
+		'key' => 'group_mixed', 'title' => 'Mixed',
+		'location' => array(
+			array( array( 'param' => 'block', 'operator' => '==', 'value' => 'acf/promo' ) ),
+			array( array( 'param' => 'post_type', 'operator' => '==', 'value' => 'page' ) ),
+		),
+	),
+);
+function acf_get_field_group( $id ) {
+	return isset( $GLOBALS['acf_groups'][ $id ] ) ? $GLOBALS['acf_groups'][ $id ] : false;
+}
+acf_register_test_field( array(
+	'key' => 'field_6aaa00000001', 'name' => 'hero_eyebrow', 'type' => 'text', 'parent' => 'group_page_hero',
+) );
+acf_register_test_field( array(
+	'key'        => 'field_6aaa00000002',
+	'name'       => 'cards',
+	'type'       => 'repeater',
+	'parent'     => 'group_block_cards',
+	'sub_fields' => array(
+		array( 'key' => 'field_661e8d0723e63', 'name' => 'description', 'type' => 'wysiwyg', 'parent' => 'field_6aaa00000002' ),
+	),
+) );
+acf_register_test_field( array(
+	'key' => 'field_6aaa00000003', 'name' => 'promo_text', 'type' => 'text', 'parent' => 'group_mixed',
+) );
+
 require_once dirname( __DIR__ ) . '/sitebridge-ai.php';
 
 // ------------------------------------------------------------- test rig -----
@@ -575,6 +614,47 @@ ok( meta_get( 'hero_banner_badges_0_badge_image' ) === null, 'its rows are gone'
 ok( meta_get( 'show_hero_banner' ) === '0' && meta_get( '_show_hero_banner' ) === 'field_61531e0536f8f', "a null scalar stores '' with an intact reference" );
 ok( $r['fields']['hero_banner_badges']['nulls_normalized'] === 1
 	&& $r['fields']['show_hero_banner']['nulls_normalized'] === 1, 'both nulls reported' );
+
+echo "\n\033[1mscenario: block-only ACF fields are refused, nothing written (v1.20)\033[0m\n";
+meta_reset( healthy_seed(), $CONTENT );
+$before = meta_snapshot();
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'field_661e8d0723e63' => '<strong>EPA Max. Contaminant Level:</strong> 4.0' ),
+) ) );
+ok( is_wp_error( $r ) && $r->get_error_code() === 'block_level_field', 'block sub-field by key → block_level_field (handoff Attempt B)' );
+ok( is_wp_error( $r ) && $r->data['status'] === 409, '... as a 409' );
+ok( is_wp_error( $r ) && strpos( $r->get_error_message(), 'acf/contaminant-cards' ) !== false
+	&& strpos( $r->get_error_message(), 'search_replace_content' ) !== false, '... naming the block and the tool to use instead' );
+ok( meta_snapshot() === $before, 'no postmeta row created or changed' );
+ok( meta_get( 'description' ) === null && meta_get( '_description' ) === null, 'specifically: no orphan description row' );
+
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'cards' => array() ),
+) ) );
+ok( is_wp_error( $r ) && $r->get_error_code() === 'block_level_field', 'the block repeater itself is refused too' );
+
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'hero_eyebrow' => 'New eyebrow', 'field_661e8d0723e63' => 'x' ),
+) ) );
+ok( is_wp_error( $r ) && meta_get( 'hero_eyebrow' ) === null, 'mixed request with one block field: all-or-nothing, page field not written either' );
+
+meta_reset( healthy_seed(), $CONTENT );
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'hero_eyebrow' => 'New eyebrow' ),
+) ) );
+ok( ! is_wp_error( $r ), 'regression: page-level group field still writes' );
+ok( ! is_wp_error( $r ) && $r['fields']['hero_eyebrow']['state']['reference_ok'] === true, '... reference_ok true' );
+ok( meta_get( 'hero_eyebrow' ) === 'New eyebrow' && meta_get( '_hero_eyebrow' ) === 'field_6aaa00000001', '... value + reference rows landed' );
+
+$r = sitebridge_acf_fields_rest( req( array(
+	'post_id' => 42,
+	'fields'  => array( 'promo_text' => 'Hello' ),
+) ) );
+ok( ! is_wp_error( $r ) && meta_get( 'promo_text' ) === 'Hello', 'mixed-location group (block OR page) is still writable' );
 
 // ---------------------------------------------------------------- summary ---
 echo "\n$PASS passed, $FAIL failed\n";
