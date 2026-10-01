@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.20.0
+ * Version:     1.21.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.20.0' );
+define( 'SITEBRIDGE_VERSION', '1.21.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -1570,13 +1570,20 @@ function sitebridge_search_replace_rest( WP_REST_Request $req ) {
 	$mismatch = null; // first abort reason, if any
 	foreach ( $pairs as $i => $p ) {
 		$found = substr_count( $working, $p['old'] );
-		$report[] = array(
+		$row   = array(
 			'old_preview' => sitebridge_sr_preview( $p['old'] ),
 			'found'       => $found,
 			'expect'      => $p['expect'],
 			'occurrence'  => $p['occurrence'],
 			'replaced'    => 0,
 		);
+		if ( 0 === $found ) {
+			// v1.21: say WHY nothing matched — escape-encoding or whitespace-class
+			// near-miss vs genuine absence (null). Only on found:0 rows, so every
+			// other row stays byte-identical to v1.20.
+			$row['near_match'] = sitebridge_sr_near_match( $working, $p['old'] );
+		}
+		$report[] = $row;
 		if ( $p['expect'] !== null && $found !== $p['expect'] ) {
 			$mismatch = $mismatch ? $mismatch : 'expect_mismatch';
 		}
@@ -1673,6 +1680,122 @@ function sitebridge_sr_replace_nth( $haystack, $old, $new, $n ) {
 function sitebridge_sr_preview( $s ) {
 	$s = (string) $s;
 	return ( strlen( $s ) <= 60 ) ? $s : substr( $s, 0, 60 ) . '…';
+}
+
+/**
+ * Diagnose a found:0 pair (v1.21). Returns null when nothing resembling `old`
+ * is in the content, otherwise an array describing the closest near-miss:
+ *
+ *   kind           block_json | block_json_pretty | unescaped | whitespace,
+ *                  or "<escape kind>+whitespace" when both apply
+ *   found          how many times the variant matches
+ *   offset         byte offset of the first variant match in the stored content
+ *   stored_preview the stored bytes around that match (exact — copy from here)
+ *   hint           what to resend
+ *
+ * The three failure modes this separates were indistinguishable before: a
+ * needle typed plainly against block-attribute JSON (which stores < > & " --
+ * as backslash-u escapes in the compact form, or / and " backslash-escaped in
+ * the older pretty-printed form), a needle carrying escapes the content does
+ * not have, and an invisible whitespace-class difference (U+00A0 no-break
+ * space, U+202F, a literal "\r\n" sequence, &nbsp;). Each one used to be a
+ * bare found:0, and operators marked fixable pages as blocked over it.
+ * Matching stays byte-exact; this only explains, it never widens what is
+ * replaced.
+ */
+function sitebridge_sr_near_match( $content, $old ) {
+	$bs = chr( 92 );
+
+	// Escape-encoding variants of the needle, in the order they're worth trying.
+	$variants = array( 'exact' => $old );
+	$compact  = str_replace(
+		array( '--', '<', '>', '&', '"' ),
+		array( $bs . 'u002d' . $bs . 'u002d', $bs . 'u003c', $bs . 'u003e', $bs . 'u0026', $bs . 'u0022' ),
+		$old
+	);
+	if ( $compact !== $old ) {
+		$variants['block_json'] = $compact;
+	}
+	$pretty = str_replace( array( '/', '"' ), array( $bs . '/', $bs . '"' ), $old );
+	if ( $pretty !== $old ) {
+		$variants['block_json_pretty'] = $pretty;
+	}
+	$decoded = sitebridge_sr_unescape( $old );
+	if ( $decoded !== $old ) {
+		$variants['unescaped'] = $decoded;
+	}
+
+	$hints = array(
+		'block_json'        => 'The stored bytes match once `old` gets compact block-JSON escaping (< > & " -- as backslash-u sequences). Resend the pair with escape:"block_json" (connector 2.14+), or send those escaped bytes yourself.',
+		'block_json_pretty' => 'The stored bytes match once / and " in `old` are backslash-escaped (older pretty-printed block JSON). Resend the pair with escape:"block_json_pretty" (connector 2.14.1+).',
+		'unescaped'         => '`old` carries backslash escapes the stored content does not have — the characters are stored plainly here. Resend without escaping (escape:"none").',
+		'whitespace'        => 'The stored bytes differ from `old` only in whitespace class (e.g. U+00A0 no-break space, U+202F, a literal "\r\n" sequence, or &nbsp; where `old` has a plain space or newline). Copy the exact bytes from stored_preview.',
+	);
+
+	// 1. Exact byte match of an escape variant.
+	foreach ( $variants as $kind => $needle ) {
+		if ( 'exact' === $kind || '' === $needle ) {
+			continue;
+		}
+		$pos = strpos( $content, $needle );
+		if ( false !== $pos ) {
+			return array(
+				'kind'           => $kind,
+				'found'          => substr_count( $content, $needle ),
+				'offset'         => $pos,
+				'stored_preview' => sitebridge_sr_stored_preview( $content, $pos, strlen( $needle ) ),
+				'hint'           => $hints[ $kind ],
+			);
+		}
+	}
+
+	// 2. Whitespace-class-insensitive match of each variant: split the needle on
+	//    whitespace runs and let any whitespace run (incl. NBSP / literal \r\n /
+	//    &nbsp;) sit between the pieces. Byte-level regex, no /u.
+	$ws = '(?:[ \t\r\n]|\xC2\xA0|\xE2\x80[\x80-\x8A\xAF]|\xE2\x81\x9F|\xE3\x80\x80|' . $bs . $bs . '[rnt]|&nbsp;)';
+	foreach ( $variants as $kind => $needle ) {
+		$pieces = preg_split( '/' . $ws . '+/', $needle, -1, PREG_SPLIT_NO_EMPTY );
+		if ( ! is_array( $pieces ) || count( $pieces ) < 2 ) {
+			continue; // no whitespace in the needle → nothing to relax
+		}
+		$pattern = '/' . implode( $ws . '+', array_map( 'preg_quote', $pieces, array_fill( 0, count( $pieces ), '/' ) ) ) . '/';
+		$n = preg_match_all( $pattern, $content, $m, PREG_OFFSET_CAPTURE );
+		if ( $n ) {
+			$pos = $m[0][0][1];
+			$len = strlen( $m[0][0][0] );
+			$k   = ( 'exact' === $kind ) ? 'whitespace' : $kind . '+whitespace';
+			return array(
+				'kind'           => $k,
+				'found'          => $n,
+				'offset'         => $pos,
+				'stored_preview' => sitebridge_sr_stored_preview( $content, $pos, $len ),
+				'hint'           => ( 'exact' === $kind ) ? $hints['whitespace'] : $hints[ $kind ] . ' ' . $hints['whitespace'],
+			);
+		}
+	}
+
+	return null;
+}
+
+/** Decode the JSON-style escapes a caller may have typed: \uXXXX, \/ and \" . */
+function sitebridge_sr_unescape( $s ) {
+	$bs = chr( 92 );
+	$s  = preg_replace_callback(
+		'/' . $bs . $bs . 'u([0-9a-fA-F]{4})/',
+		function ( $m ) {
+			$ch = json_decode( '"' . chr( 92 ) . 'u' . $m[1] . '"' );
+			return is_string( $ch ) ? $ch : $m[0]; // lone surrogate half → leave as-is
+		},
+		$s
+	);
+	return str_replace( array( $bs . '/', $bs . '"' ), array( '/', '"' ), $s );
+}
+
+/** Exact stored bytes around a match, trimmed to UTF-8 boundaries, ≤ ~200 bytes. */
+function sitebridge_sr_stored_preview( $content, $pos, $len ) {
+	$start = max( 0, $pos - 24 );
+	$take  = min( $len + 48, 200 );
+	return function_exists( 'mb_strcut' ) ? mb_strcut( $content, $start, $take, 'UTF-8' ) : substr( $content, $start, $take );
 }
 
 /**
