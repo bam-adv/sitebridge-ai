@@ -1,0 +1,101 @@
+# Release gate — makes "the fleet never got the release" unrepeatable.
+#
+# The plugin self-updates by polling GitHub releases/latest and comparing the
+# release tag against SITEBRIDGE_VERSION. A release whose tag, header and
+# constant disagree, or whose signed .zip is missing or stale, silently never
+# reaches any site. This workflow fails loudly instead.
+#
+#  - every push / PR: the `Version:` header and SITEBRIDGE_VERSION agree.
+#  - tag push (v*):   both equal the tag.
+#  - release published/edited: both equal the tag, AND the release carries
+#    sitebridge-ai.zip + sitebridge-ai.zip.sig, the zip's plugin file is
+#    byte-identical to the tagged source, and the .sig verifies against the
+#    embedded SITEBRIDGE_UPDATE_PUBKEY (what every site checks before install).
+name: Release gate
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  release:
+    types: [published, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version the source declares
+        id: src
+        run: |
+          set -euo pipefail
+          HEADER=$(grep -m1 -E '^\s*\*\s*Version:' sitebridge-ai.php | sed -E 's/.*Version:[[:space:]]*//; s/[[:space:]]*$//')
+          CONST=$(grep -m1 -E "define\( *'SITEBRIDGE_VERSION'" sitebridge-ai.php | sed -E "s/.*'SITEBRIDGE_VERSION', *'([^']+)'.*/\1/")
+          echo "header=$HEADER" >> "$GITHUB_OUTPUT"
+          echo "const=$CONST"   >> "$GITHUB_OUTPUT"
+          echo "Version: header = $HEADER"
+          echo "SITEBRIDGE_VERSION = $CONST"
+          if [ -z "$HEADER" ] || [ "$HEADER" != "$CONST" ]; then
+            echo "::error::Version: header ($HEADER) and SITEBRIDGE_VERSION ($CONST) disagree"
+            exit 1
+          fi
+
+      - name: Tag matches the declared version
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        env:
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+          HEADER: ${{ steps.src.outputs.header }}
+        run: |
+          set -euo pipefail
+          BARE="${TAG#v}"; BARE="${BARE#V}"
+          echo "tag = $TAG (bare $BARE)"
+          if [ "$BARE" != "$HEADER" ]; then
+            echo "::error::Release tag $TAG does not match the plugin's Version: header $HEADER — sites compare SITEBRIDGE_VERSION against the tag, so this release would never be offered (or would be offered forever)."
+            exit 1
+          fi
+
+      - name: Release carries a signed zip built from this exact source
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rel
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir /tmp/rel \
+            --pattern sitebridge-ai.zip --pattern sitebridge-ai.zip.sig
+          test -s /tmp/rel/sitebridge-ai.zip     || { echo "::error::release has no sitebridge-ai.zip asset — the updater falls back to the unsigned zipball, which every site refuses"; exit 1; }
+          test -s /tmp/rel/sitebridge-ai.zip.sig || { echo "::error::release has no sitebridge-ai.zip.sig asset — unsigned, every site refuses it"; exit 1; }
+          # The zip must unpack to sitebridge-ai/ and carry exactly the tagged plugin file.
+          unzip -l /tmp/rel/sitebridge-ai.zip | grep -q ' sitebridge-ai/sitebridge-ai.php$' \
+            || { echo "::error::sitebridge-ai.zip does not unpack to sitebridge-ai/sitebridge-ai.php"; exit 1; }
+          unzip -p /tmp/rel/sitebridge-ai.zip sitebridge-ai/sitebridge-ai.php > /tmp/rel/zipped.php
+          cmp /tmp/rel/zipped.php sitebridge-ai.php \
+            || { echo "::error::the plugin file inside sitebridge-ai.zip is not byte-identical to the tagged source"; exit 1; }
+          echo "zip contents match the tagged source"
+
+      - uses: shivammathur/setup-php@v2
+        if: github.event_name == 'release'
+        with:
+          php-version: '8.2'
+          extensions: sodium
+
+      - name: Signature verifies against the embedded public key
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          php -r '
+            $src = file_get_contents( "sitebridge-ai.php" );
+            if ( ! preg_match( "/SITEBRIDGE_UPDATE_PUBKEY\s*=\s*\x27([^\x27]+)\x27/", $src, $m ) ) { fwrite( STDERR, "no SITEBRIDGE_UPDATE_PUBKEY in source\n" ); exit( 1 ); }
+            $pk  = base64_decode( $m[1], true );
+            $sig = base64_decode( trim( file_get_contents( "/tmp/rel/sitebridge-ai.zip.sig" ) ), true );
+            $zip = file_get_contents( "/tmp/rel/sitebridge-ai.zip" );
+            if ( $pk === false || $sig === false || strlen( $pk ) !== SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES ) { fwrite( STDERR, "pubkey or signature is not valid base64\n" ); exit( 1 ); }
+            if ( ! sodium_crypto_sign_verify_detached( $sig, $zip, $pk ) ) { fwrite( STDERR, "sitebridge-ai.zip.sig does NOT verify against SITEBRIDGE_UPDATE_PUBKEY — every site will refuse this release\n" ); exit( 1 ); }
+            echo "signature verifies\n";
+          '
