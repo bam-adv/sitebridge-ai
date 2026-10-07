@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.20.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.21.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -31,7 +31,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.20.0)
+## REST surface (v1.21.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -81,6 +81,14 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   against the stored `\u003c`/`\r\n` bytes. The observed "decoding" happens in the MCP client's tool-call
   layer, which rewrites `\uXXXX` in tool arguments before they reach the connector (it leaves
   `\r\n` alone). The connector's `escape:"block_json"` mode is the answer to that, not a plugin change.
+  **v1.21** — a `found:0` row carries **`near_match`**: `null` for genuine absence, otherwise
+  `{kind, found, offset, stored_preview, hint}` naming the closest near-miss — `block_json`
+  (needle matches once compact block-JSON escaping is applied), `block_json_pretty` (older
+  pretty-printed form: `/` and `"` backslash-escaped), `unescaped` (needle carries escapes the
+  content doesn't), `whitespace` (U+00A0 / U+202F / literal `\r\n` / `&nbsp;` where the needle has
+  a plain space), or `<escape kind>+whitespace`. `stored_preview` is the exact stored bytes around
+  the first variant match, so the caller can copy them. Rows with `found > 0` are unchanged.
+  Diagnosis only — matching is still byte-exact and nothing is ever replaced via a variant.
 - **Yoast meta** (v1.13+, extended v1.15): `POST /yoast-meta` — writes `_yoast_wpseo_canonical` and
   `_yoast_wpseo_meta-robots-noindex` via `update_post_meta`/`delete_post_meta` (these two keys aren't
   dependably core-REST-writable). `canonical:""` clears; robots `index|noindex|default` maps to
@@ -223,12 +231,14 @@ page-level and mixed-location groups still writable). Its live
 assumptions (sub-field keys resolve individually via `acf_get_field()`; composite keys return
 false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 
-`php tests/search-replace-acceptance.php` — 25 assertions over `/search-replace` with a one-row
+`php tests/search-replace-acceptance.php` — 41 assertions over `/search-replace` with a one-row
 `$wpdb` and a real ACF-block-JSON fixture (built with `chr(92)` so no tool in the authoring chain
 can decode its escapes — see the v1.20 note above; the same client-side decoding bit this very
 file while it was being written). Covers byte-exact escape matching + the 40-byte round trip,
 `occurrence` (middle-of-3, sequential indexing, out-of-range abort with zero writes, validation,
-composition with `expect`), and the no-`occurrence` regression.
+composition with `expect`), the no-`occurrence` regression, and (v1.21) `near_match` for every
+kind — compact / pretty / unescaped / whitespace (NBSP) / combined — plus null on genuine absence,
+absence of the key on `found > 0` rows, and presence on an `expect`-aborted row.
 
 `php tests/purge-acceptance.php` — the purge route's NitroPack branch, one subprocess per
 `function_exists()`/`defined()` state (present/connected, disconnected, API-throws, legacy

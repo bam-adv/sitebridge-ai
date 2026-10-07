@@ -197,5 +197,63 @@ seed();
 $r = sr( array( 'post_id' => 7, 'replacements' => array( array( 'old' => 'e 10\r\n', 'new' => 'x', 'expect' => 2 ) ) ) );
 ok( $r['reason'] === 'expect_mismatch' && $GLOBALS['wpdb']->writes === 0, 'plain expect mismatch unchanged' );
 
+echo "\n\033[1mscenario: found:0 explains itself — near_match (v1.21)\033[0m\n";
+$BS = chr( 92 );
+// compact block JSON: plain needle → block_json
+seed();
+$plain = '<strong>Public Health Goal:</strong> 10';
+$r = sr( array( 'post_id' => 7, 'replacements' => array( array( 'old' => $plain, 'new' => 'X' ) ) ) );
+$nm = $r['pairs'][0]['near_match'];
+ok( $r['pairs'][0]['found'] === 0 && is_array( $nm ) && $nm['kind'] === 'block_json', 'plain needle vs compact block JSON → near_match.kind block_json' );
+ok( $nm['found'] === 1 && $nm['offset'] === strpos( $CONTENT, blockesc( $plain ) ), 'variant found once at the stored offset' );
+ok( strpos( $nm['stored_preview'], blockesc( 'Goal:</strong> 10' ) ) !== false, 'stored_preview carries the exact stored (escaped) bytes' );
+ok( strpos( $nm['hint'], 'escape:"block_json"' ) !== false, 'hint says to resend with escape:"block_json"' );
+
+// pretty-printed block JSON (older ACF save): / and " backslash-escaped, < > literal
+$GLOBALS['wpdb']->content = '<!-- wp:acf/product-callouts {' . "\n" . '    "data": {' . "\n"
+	. '        "products_0_description": "<ul>' . $BS . 'r' . $BS . 'n ' . $BS . 't<li>7 stages of filtration<' . $BS . '/li>' . $BS . 'r' . $BS . 'n<' . $BS . '/ul>",' . "\n"
+	. '        "_products_0_description": "field_615704516695a"' . "\n" . '    }' . "\n" . '} /-->';
+$r = sr( array( 'post_id' => 7, 'replacements' => array( array( 'old' => '<li>7 stages of filtration</li>', 'new' => 'X' ) ) ) );
+$nm = $r['pairs'][0]['near_match'];
+ok( $r['pairs'][0]['found'] === 0 && $nm['kind'] === 'block_json_pretty' && $nm['found'] === 1, 'plain needle vs pretty block JSON → block_json_pretty' );
+ok( strpos( $nm['stored_preview'], '<' . $BS . '/li>' ) !== false && strpos( $nm['hint'], 'block_json_pretty' ) !== false, 'preview shows the stored backslash-slash; hint names the mode' );
+
+// needle carries escapes, content stores plain characters → unescaped
+$GLOBALS['wpdb']->content = '<!-- wp:paragraph --><p><strong>Public Health Goal:</strong> 10</p><!-- /wp:paragraph -->';
+$r = sr( array( 'post_id' => 7, 'replacements' => array( array( 'old' => blockesc( '<strong>Public Health Goal:</strong> 10' ), 'new' => 'X' ) ) ) );
+$nm = $r['pairs'][0]['near_match'];
+ok( $r['pairs'][0]['found'] === 0 && $nm['kind'] === 'unescaped' && $nm['offset'] === strpos( $GLOBALS['wpdb']->content, '<strong>' ), 'escaped needle vs plain content → unescaped, at the right offset' );
+
+// invisible whitespace: NBSP in the content where the needle has a space
+$NBSP = "\xC2\xA0";
+$GLOBALS['wpdb']->content = '<p>EPA Max. Contaminant Level: 10. Public' . $NBSP . 'Health Goal: 10.</p>';
+$r = sr( array( 'post_id' => 7, 'replacements' => array( array( 'old' => 'Public Health Goal: 10', 'new' => 'X' ) ) ) );
+$nm = $r['pairs'][0]['near_match'];
+ok( $r['pairs'][0]['found'] === 0 && $nm['kind'] === 'whitespace' && $nm['found'] === 1, 'NBSP in content → whitespace' );
+ok( $nm['offset'] === strpos( $GLOBALS['wpdb']->content, 'Public' . $NBSP ) && strpos( $nm['stored_preview'], 'Public' . $NBSP . 'Health' ) !== false, 'offset + stored_preview expose the NBSP bytes' );
+ok( strpos( $nm['hint'], 'U+00A0' ) !== false, 'hint names the no-break space' );
+
+// both at once: compact block JSON with a literal \r\n where the needle has a newline
+seed();
+$r = sr( array( 'post_id' => 7, 'replacements' => array( array( 'old' => "Level:</strong> 10\n<strong>Public Health Goal:</strong> 10", 'new' => 'X' ) ) ) );
+$nm = $r['pairs'][0]['near_match'];
+ok( $r['pairs'][0]['found'] === 0 && $nm['kind'] === 'block_json+whitespace' && $nm['found'] === 1, 'escaping + literal \\r\\n vs newline → block_json+whitespace' );
+ok( $nm['offset'] === strpos( $CONTENT, blockesc( 'Level:</strong> 10' ) . '\r\n' . blockesc( '<strong>Public' ) ), 'and it is the fluoride card, not arsenic' );
+
+// genuinely absent → null; found>0 rows carry no near_match at all
+seed();
+$r = sr( array( 'post_id' => 7, 'replacements' => array(
+	array( 'old' => 'zzzz nothing like this zzzz', 'new' => 'X' ),
+	array( 'old' => 'e 10\r\n', 'new' => 'e 11\r\n' ),
+) ) );
+ok( array_key_exists( 'near_match', $r['pairs'][0] ) && $r['pairs'][0]['near_match'] === null, 'genuine absence → near_match:null (key present)' );
+ok( ! array_key_exists( 'near_match', $r['pairs'][1] ) && $r['pairs'][1]['found'] === 3, 'found>0 row unchanged — no near_match key' );
+
+// still present when expect aborts the request (the case that used to be undiagnosable)
+seed();
+$r = sr( array( 'post_id' => 7, 'dry_run' => false, 'replacements' => array( array( 'old' => $plain, 'new' => 'X', 'expect' => 1 ) ) ) );
+ok( $r['aborted'] === true && $r['reason'] === 'expect_mismatch' && $r['pairs'][0]['near_match']['kind'] === 'block_json', 'expect-aborted found:0 row still carries near_match' );
+ok( $GLOBALS['wpdb']->writes === 0 && $GLOBALS['wpdb']->content === $CONTENT, 'diagnosis never writes' );
+
 echo "\n$PASS passed, $FAIL failed\n";
 exit( $FAIL === 0 ? 0 : 1 );
