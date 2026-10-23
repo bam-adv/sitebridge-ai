@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.21.0
+ * Version:     1.22.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.21.0' );
+define( 'SITEBRIDGE_VERSION', '1.22.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -2168,6 +2168,21 @@ function sitebridge_acf_block_only_group( $field ) {
 		$up     = acf_get_field( $parent );
 		$parent = ( $up && isset( $up['parent'] ) ) ? $up['parent'] : null;
 	}
+	$blocks = sitebridge_acf_group_block_only_blocks( $group );
+	if ( $blocks === null ) {
+		return null;
+	}
+	$group['_blocks'] = $blocks;
+	return $group;
+}
+
+/**
+ * The block names a field group is located on, IF every OR-branch of its
+ * location rules carries a `block == …` rule (block-only group); null for a
+ * page-level, mixed-location, or undeterminable group. Shared by the write
+ * route's v1.20 guard and the v1.22 read route.
+ */
+function sitebridge_acf_group_block_only_blocks( $group ) {
 	if ( empty( $group ) || empty( $group['location'] ) || ! is_array( $group['location'] ) ) {
 		return null;
 	}
@@ -2184,8 +2199,165 @@ function sitebridge_acf_block_only_group( $field ) {
 			return null; // this OR-branch targets something other than a block
 		}
 	}
-	$group['_blocks'] = array_values( array_unique( $blocks ) );
-	return $group;
+	return array_values( array_unique( $blocks ) );
+}
+
+/* ============================================================================
+ * ACF FIELDS: authenticated page-level (meta-box) field READS (v1.22)
+ * ----------------------------------------------------------------------------
+ * GET /bam/v1/acf-fields/{post_id} — query: group (key or title, optional),
+ * format (bool, default false), verify (bool, default false).
+ *
+ * The read mirror of the POST route above. Until now the connector read
+ * page-level ACF values through core REST's `acf` key, which only exists when
+ * the field group has "Show in REST API" switched on — a manual, per-site,
+ * per-group admin setting that also publishes the values to unauthenticated
+ * readers. This route needs no such setting and is gated like the write
+ * route (manage_options + Application Password), so a site is readable the
+ * moment the plugin is installed, with nothing exposed publicly.
+ *
+ * Deliberately dumb: no group allowlist, no post-type assumptions. It returns
+ * every page-level group whose location rules match the post, with values
+ * read by FIELD KEY through get_field() — i.e. through the `_`-reference rows,
+ * the same resolution the front end uses, so a corrupted reference reads back
+ * empty here exactly as it renders empty on the page. Which fields matter is
+ * the caller's judgment.
+ *
+ * Values are UNFORMATTED by default (raw stored shape — image fields are
+ * attachment IDs, not arrays), so what this returns is what the POST route
+ * accepts: read → modify → write round-trips. `format=1` opts into ACF's
+ * formatting filters; it is off by default because theme value-filters can
+ * fatal (the capability collector avoids get_field() for the same reason),
+ * and each group's read is try/catch-guarded so one bad filter degrades to a
+ * per-group error rather than a failed request.
+ *
+ * Block-only groups (every location branch is a `block == …` rule) are listed
+ * by name under `block_only_groups` with NO values — their values are block
+ * attributes inside post_content, read via the post content and edited via
+ * /search-replace — so the caller is told where to look instead of seeing
+ * silence. Read-only by construction: no option, transient, or meta write.
+ * ========================================================================== */
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( SITEBRIDGE_NS, '/acf-fields/(?P<post_id>\d+)', array(
+		'methods'             => 'GET',
+		'callback'            => 'sitebridge_acf_fields_read_rest',
+		'permission_callback' => function () { return current_user_can( 'manage_options' ); },
+		'args'                => array(
+			'post_id' => array( 'required' => true,  'type' => 'integer' ),
+			'group'   => array( 'required' => false, 'type' => 'string' ),
+			'format'  => array( 'required' => false, 'type' => 'boolean' ),
+			'verify'  => array( 'required' => false, 'type' => 'boolean' ),
+		),
+	) );
+} );
+
+function sitebridge_acf_fields_read_rest( WP_REST_Request $req ) {
+	if ( ! function_exists( 'get_field' ) || ! function_exists( 'acf_get_field_groups' ) || ! function_exists( 'acf_get_fields' ) ) {
+		return new WP_Error( 'acf_missing', 'ACF is not active', array( 'status' => 500 ) );
+	}
+
+	$post_id = (int) $req['post_id'];
+	$post    = $post_id > 0 ? get_post( $post_id ) : null;
+	if ( ! $post ) {
+		return new WP_Error( 'not_found', sprintf( 'No post with ID %d', $post_id ), array( 'status' => 404 ) );
+	}
+
+	$want   = ( $req['group'] !== null ) ? trim( (string) $req['group'] ) : '';
+	$format = ( $req['format'] !== null ) && filter_var( $req['format'], FILTER_VALIDATE_BOOLEAN );
+	$verify = ( $req['verify'] !== null ) && filter_var( $req['verify'], FILTER_VALIDATE_BOOLEAN );
+
+	// Groups whose location rules match this post — ACF's own matcher, so
+	// post type, template, taxonomy, page-parent rules etc. all apply.
+	$matched = (array) acf_get_field_groups( array(
+		'post_id'   => $post_id,
+		'post_type' => $post->post_type,
+	) );
+
+	// Block-only groups never match a post context in ACF's matcher, so they
+	// are found from the full group list instead, and listed only when one of
+	// their blocks is actually present in this post's content.
+	$block_only = array();
+	foreach ( (array) acf_get_field_groups() as $group ) {
+		if ( empty( $group['key'] ) ) {
+			continue;
+		}
+		$blocks = sitebridge_acf_group_block_only_blocks( $group );
+		if ( $blocks === null ) {
+			continue;
+		}
+		$present = array();
+		foreach ( $blocks as $b ) {
+			if ( function_exists( 'has_block' ) ? has_block( $b, $post ) : ( strpos( (string) $post->post_content, '<!-- wp:' . $b ) !== false ) ) {
+				$present[] = $b;
+			}
+		}
+		if ( $present ) {
+			$block_only[] = array(
+				'key'    => $group['key'],
+				'title'  => isset( $group['title'] ) ? (string) $group['title'] : '',
+				'blocks' => $present,
+			);
+		}
+	}
+
+	$groups     = array();
+	$found_want = false;
+
+	foreach ( $matched as $group ) {
+		if ( empty( $group['key'] ) ) {
+			continue;
+		}
+		$title = isset( $group['title'] ) ? (string) $group['title'] : '';
+		if ( $want !== '' && $want !== $group['key'] && strcasecmp( $want, $title ) !== 0 ) {
+			continue;
+		}
+		$found_want = true;
+
+		// Defensive: ACF shouldn't hand a block-only group back for a post
+		// context, but if it does its values aren't in postmeta — skip it.
+		if ( sitebridge_acf_group_block_only_blocks( $group ) !== null ) {
+			continue;
+		}
+
+		$entry = array( 'key' => $group['key'], 'title' => $title, 'fields' => array(), 'types' => array(), 'keys' => array() );
+		try {
+			foreach ( (array) acf_get_fields( $group ) as $field ) {
+				if ( empty( $field['key'] ) || empty( $field['name'] ) ) {
+					continue;
+				}
+				$entry['types'][ $field['name'] ]  = isset( $field['type'] ) ? $field['type'] : '';
+				$entry['keys'][ $field['name'] ]   = $field['key'];
+				$entry['fields'][ $field['name'] ] = get_field( $field['key'], $post_id, $format );
+				if ( $verify ) {
+					$entry['state'][ $field['name'] ] = sitebridge_acf_field_state( $post_id, $field );
+				}
+			}
+		} catch ( \Throwable $e ) {
+			// A theme value-filter blew up inside get_field(); report the group
+			// rather than failing the whole read.
+			$entry['error'] = sprintf( '%s: %s', get_class( $e ), $e->getMessage() );
+		}
+		$groups[] = $entry;
+	}
+
+	if ( $want !== '' && ! $found_want ) {
+		return new WP_Error(
+			'group_not_found',
+			sprintf( 'No field group "%s" is located on post %d. Groups here: %s', $want, $post_id,
+				implode( ', ', array_map( function ( $g ) { return $g['key'] . ' (' . ( isset( $g['title'] ) ? $g['title'] : '' ) . ')'; }, $matched ) ) ?: 'none' ),
+			array( 'status' => 404 )
+		);
+	}
+
+	return array(
+		'post_id'           => $post_id,
+		'post_type'         => $post->post_type,
+		'format'            => $format,
+		'groups'            => $groups,
+		'block_only_groups' => $block_only,
+		'plugin_version'    => SITEBRIDGE_VERSION,
+	);
 }
 
 /**
