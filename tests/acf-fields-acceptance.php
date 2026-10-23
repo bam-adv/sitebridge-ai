@@ -141,7 +141,10 @@ function get_post( $id ) {
 	if ( (int) $id !== 42 ) {
 		return null;
 	}
-	return (object) array( 'ID' => 42, 'post_content' => $GLOBALS['post_content'] );
+	return (object) array( 'ID' => 42, 'post_type' => 'page', 'post_content' => $GLOBALS['post_content'] );
+}
+function has_block( $name, $post ) {
+	return strpos( (string) $post->post_content, '<!-- wp:' . $name ) !== false;
 }
 function get_post_meta( $post_id, $key, $single = false ) {
 	$v = meta_get( $key );
@@ -247,14 +250,16 @@ function acf_register_test_field( $field ) {
 	$GLOBALS['acf_fields'][ $field['key'] ] = $field;
 }
 acf_register_test_field( array(
-	'key'  => 'field_61531e0536f8f',
-	'name' => 'show_hero_banner',
-	'type' => 'true_false',
+	'key'    => 'field_61531e0536f8f',
+	'name'   => 'show_hero_banner',
+	'type'   => 'true_false',
+	'parent' => 'group_page_hero',
 ) );
 acf_register_test_field( array(
 	'key'        => 'field_61bce16ca13a6',
 	'name'       => 'hero_banner_badges',
 	'type'       => 'repeater',
+	'parent'     => 'group_page_hero',
 	'sub_fields' => array(
 		array( 'key' => 'field_61bce179a13a7', 'name' => 'badge_image', 'type' => 'image' ),
 	),
@@ -359,7 +364,42 @@ function update_field( $key, $value, $post_id = false ) {
 	meta_set( '_' . $name, $field['key'] );
 	return true;
 }
-function get_field( $field, $post_id = false ) { return null; }
+// get_field() as the front end resolves it: value row by NAME, but only if
+// the "_"-reference row holds a key that resolves to a registered field —
+// a corrupted reference reads back as null, exactly as the template renders
+// nothing. Unformatted shape (format_value=false): raw stored values, repeater
+// rows rebuilt from "{name}_{i}_{sub}" rows. `format=true` runs the optional
+// $GLOBALS['acf_format_filter'] so a fataling theme filter can be emulated.
+$GLOBALS['get_field_calls'] = array();
+function get_field( $selector, $post_id = false, $format_value = true ) {
+	$GLOBALS['get_field_calls'][] = array( $selector, $post_id, $format_value );
+	$field = acf_get_field( $selector );
+	if ( ! $field ) {
+		return null;
+	}
+	$name = $field['name'];
+	if ( meta_get( '_' . $name ) !== $field['key'] ) {
+		return null;
+	}
+	if ( $field['type'] === 'repeater' ) {
+		$count = (int) meta_get( $name );
+		$rows  = array();
+		for ( $i = 0; $i < $count; $i++ ) {
+			$row = array();
+			foreach ( $field['sub_fields'] as $sub ) {
+				$row[ $sub['name'] ] = meta_get( $name . '_' . $i . '_' . $sub['name'] );
+			}
+			$rows[] = $row;
+		}
+		$value = $rows;
+	} else {
+		$value = meta_get( $name );
+	}
+	if ( $format_value && isset( $GLOBALS['acf_format_filter'] ) ) {
+		$value = call_user_func( $GLOBALS['acf_format_filter'], $value, $field );
+	}
+	return $value;
+}
 function get_fields( $post_id = false ) { return array(); }
 
 // Field groups (v1.20 block-level guard). A page-level group located on a post
@@ -384,6 +424,43 @@ $GLOBALS['acf_groups'] = array(
 );
 function acf_get_field_group( $id ) {
 	return isset( $GLOBALS['acf_groups'][ $id ] ) ? $GLOBALS['acf_groups'][ $id ] : false;
+}
+// Location matching for the read route: a group matches when any OR-branch is
+// satisfied; post_type rules compare against the post, block rules never match
+// a post context (ACF's own behavior), and $GLOBALS['acf_groups_unlocated']
+// lists groups whose rules target something else entirely.
+function acf_get_field_groups( $filter = array() ) {
+	$out = array();
+	foreach ( $GLOBALS['acf_groups'] as $g ) {
+		if ( empty( $filter ) ) { $out[] = $g; continue; }
+		$match = false;
+		foreach ( (array) $g['location'] as $and_rules ) {
+			$all = true;
+			foreach ( (array) $and_rules as $rule ) {
+				if ( $rule['param'] === 'post_type' ) {
+					$all = $all && isset( $filter['post_type'] ) && $filter['post_type'] === $rule['value'];
+				} elseif ( $rule['param'] === 'block' ) {
+					$all = false;
+				} else {
+					$all = false;
+				}
+			}
+			if ( $all ) { $match = true; break; }
+		}
+		// Block-only groups are excluded under a post filter (no block screen
+		// context), mixed-location groups match through their page branch —
+		// both as real ACF behaves.
+		if ( $match ) { $out[] = $g; }
+	}
+	return $out;
+}
+function acf_get_fields( $group ) {
+	$key = is_array( $group ) ? $group['key'] : $group;
+	$out = array();
+	foreach ( $GLOBALS['acf_fields'] as $f ) {
+		if ( isset( $f['parent'] ) && $f['parent'] === $key ) { $out[] = $f; }
+	}
+	return $out;
 }
 acf_register_test_field( array(
 	'key' => 'field_6aaa00000001', 'name' => 'hero_eyebrow', 'type' => 'text', 'parent' => 'group_page_hero',
@@ -657,5 +734,70 @@ $r = sitebridge_acf_fields_rest( req( array(
 ok( ! is_wp_error( $r ) && meta_get( 'promo_text' ) === 'Hello', 'mixed-location group (block OR page) is still writable' );
 
 // ---------------------------------------------------------------- summary ---
+
+// ---------------------------------------------------- v1.22 read route -------
+echo "\n\033[1mscenario: v1.22 GET /acf-fields/{id} — page-level groups, raw values, no writes\033[0m\n";
+meta_reset( healthy_seed(), $CONTENT );
+$GLOBALS['get_field_calls'] = array();
+$before = meta_snapshot();
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42 ) ) );
+ok( ! is_wp_error( $r ), 'read succeeds' );
+ok( $r['post_type'] === 'page' && $r['format'] === false, 'post_type reported, format defaults to false' );
+$by_key = array();
+foreach ( $r['groups'] as $g ) { $by_key[ $g['key'] ] = $g; }
+ok( isset( $by_key['group_page_hero'] ) && isset( $by_key['group_mixed'] ), 'page-level and mixed-location groups returned' );
+ok( ! isset( $by_key['group_block_cards'] ), 'block-only group is NOT among the value groups' );
+ok( $r['block_only_groups'] === array(), 'block-only group not listed when its block is absent from the content' );
+$hero = $by_key['group_page_hero'];
+ok( $hero['fields']['show_hero_banner'] === '1', 'true_false read raw (stored "1"), not formatted' );
+ok( $hero['fields']['hero_banner_badges'] === array( array( 'badge_image' => '4001' ), array( 'badge_image' => '4225' ) ), 'repeater rows rebuilt from row meta, image as raw attachment ID' );
+ok( $hero['keys']['hero_banner_badges'] === 'field_61bce16ca13a6' && $hero['types']['hero_banner_badges'] === 'repeater', 'keys + types map names to real field keys and types' );
+ok( ! isset( $hero['state'] ), 'verify off by default: no per-field state' );
+$all_by_key = array_filter( $GLOBALS['get_field_calls'], function ( $c ) { return strpos( $c[0], 'field_' ) === 0 && $c[2] === false; } );
+ok( count( $all_by_key ) === count( $GLOBALS['get_field_calls'] ), 'every get_field() call is by FIELD KEY with format_value=false' );
+ok( meta_snapshot() === $before, 'zero meta writes during a read' );
+
+echo "\n\033[1mscenario: read reflects reference-row truth (corrupted reference reads empty)\033[0m\n";
+$seed = healthy_seed();
+$seed['_hero_banner_badges'] = 'field_617af16e582f3_field_61bce16ca13a6'; // composite corruption
+meta_reset( $seed, $CONTENT );
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42, 'verify' => true ) ) );
+foreach ( $r['groups'] as $g ) { if ( $g['key'] === 'group_page_hero' ) { $hero = $g; } }
+ok( $hero['fields']['hero_banner_badges'] === null, 'corrupted reference → value reads null (as the front end renders nothing)' );
+ok( $hero['state']['hero_banner_badges']['reference_ok'] === false, 'verify=1 exposes reference_ok:false for the corrupted field' );
+ok( $hero['state']['show_hero_banner']['reference_ok'] === true, '…and true for the healthy one' );
+
+echo "\n\033[1mscenario: block-only group listed (no values) when its block is in the content\033[0m\n";
+meta_reset( healthy_seed(), '<!-- wp:acf/contaminant-cards {"data":{"cards":1}} /--><!-- wp:paragraph --><p>x</p><!-- /wp:paragraph -->' );
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42 ) ) );
+ok( count( $r['block_only_groups'] ) === 1 && $r['block_only_groups'][0]['key'] === 'group_block_cards', 'block-only group reported by key' );
+ok( $r['block_only_groups'][0]['blocks'] === array( 'acf/contaminant-cards' ) && ! isset( $r['block_only_groups'][0]['fields'] ), 'with its block names and no field values' );
+
+echo "\n\033[1mscenario: group filter by key / title, 404 on unknown\033[0m\n";
+meta_reset( healthy_seed(), $CONTENT );
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42, 'group' => 'group_mixed' ) ) );
+ok( count( $r['groups'] ) === 1 && $r['groups'][0]['key'] === 'group_mixed', 'filter by group key' );
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42, 'group' => 'hero' ) ) );
+ok( count( $r['groups'] ) === 1 && $r['groups'][0]['key'] === 'group_page_hero', 'filter by title, case-insensitive' );
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42, 'group' => 'nope' ) ) );
+ok( is_wp_error( $r ) && $r->get_error_code() === 'group_not_found' && $r->data['status'] === 404, 'unknown group → 404 group_not_found' );
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 999 ) ) );
+ok( is_wp_error( $r ) && $r->get_error_code() === 'not_found', 'unknown post → 404' );
+
+echo "\n\033[1mscenario: format=1 runs ACF formatting; a fataling theme filter degrades to a per-group error\033[0m\n";
+meta_reset( healthy_seed(), $CONTENT );
+$GLOBALS['acf_format_filter'] = function ( $v, $f ) { return $f['type'] === 'true_false' ? (bool) $v : $v; };
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42, 'format' => '1' ) ) );
+foreach ( $r['groups'] as $g ) { if ( $g['key'] === 'group_page_hero' ) { $hero = $g; } }
+ok( $r['format'] === true && $hero['fields']['show_hero_banner'] === true, 'format=1: true_false comes back as a real boolean' );
+$GLOBALS['acf_format_filter'] = function ( $v, $f ) { if ( $f['name'] === 'hero_banner_badges' ) { throw new Error( 'theme filter fatal' ); } return $v; };
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42, 'format' => true ) ) );
+ok( ! is_wp_error( $r ), 'request still succeeds' );
+foreach ( $r['groups'] as $g ) { if ( $g['key'] === 'group_page_hero' ) { $hero = $g; } }
+ok( isset( $hero['error'] ) && strpos( $hero['error'], 'theme filter fatal' ) !== false, 'the failing group carries an error…' );
+foreach ( $r['groups'] as $g ) { if ( $g['key'] === 'group_mixed' ) { $mixed = $g; } }
+ok( ! isset( $mixed['error'] ) && array_key_exists( 'promo_text', $mixed['fields'] ), '…and the other group is unaffected' );
+unset( $GLOBALS['acf_format_filter'] );
+
 echo "\n$PASS passed, $FAIL failed\n";
 exit( $FAIL === 0 ? 0 : 1 );

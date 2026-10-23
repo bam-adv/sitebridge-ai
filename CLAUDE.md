@@ -1,10 +1,10 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.21.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.22.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
-writes**, **read-only capability findings** (site viability discovery), **scheduled republish**
+reads + writes**, **read-only capability findings** (site viability discovery), **scheduled republish**
 (Duplicate Post rewrite-copy staging with publish-date preservation). Self-updates from GitHub releases. Host- and site-agnostic by design.
 
 ## Where this sits (3 layers — don't conflate them)
@@ -15,10 +15,12 @@ writes**, **read-only capability findings** (site viability discovery), **schedu
 3. **Claude chat skills** (`content-publish`, `schema-deploy`, …) — live in Devon's Claude settings,
    not in any repo; they drive layer 2.
 
-Posts / media / ACF-field READS the connector does are **core WP + ACF REST**, not this plugin.
-ACF-field WRITES are this plugin's job since v1.17 (`/acf-fields`) — the core-REST `acf` write
-path corrupts field reference rows on seamless-clone groups and must not be used (see the route's
-docblock). (The theme's hero meta-box→block migration is unrelated to this plugin; its notes live
+Posts / media READS the connector does are **core WP REST**, not this plugin. ACF-field WRITES
+are this plugin's job since v1.17 (`POST /acf-fields`) — the core-REST `acf` write path corrupts
+field reference rows on seamless-clone groups and must not be used (see the route's docblock) —
+and ACF-field READS since v1.22 (`GET /acf-fields/{post_id}`), which removes the dependency on
+the field group's "Show in REST API" setting (the connector falls back to core REST's `acf` key
+on older plugins). (The theme's hero meta-box→block migration is unrelated to this plugin; its notes live
 in the content-publish skill.)
 
 ## Heritage / compatibility (don't break)
@@ -31,7 +33,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.21.0)
+## REST surface (v1.22.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -136,6 +138,25 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   written (all-or-nothing, like unknown selectors). Mixed-location groups (block OR page) and
   undeterminable groups keep the old behavior. Writing block attributes for real (parse block
   JSON, re-serialize with the exact escaping) is scoped separately.
+  **v1.22** — **`GET /acf-fields/(?P<post_id>\d+)`**, the read mirror (issue #21). Query:
+  `group` (key or title, case-insensitive; 404 `group_not_found` names the groups that ARE
+  there), `format` (default false), `verify` (default false). Same `manage_options` gate as the
+  write route, so a site is readable the moment the plugin is installed and nothing is published
+  to unauthenticated readers — the reason this exists: core REST's `acf` key needs the group's
+  "Show in REST API" toggle, a manual per-site click that also makes the values public.
+  Returns `groups[]` = every page-level group whose location rules match the post (ACF's own
+  matcher via `acf_get_field_groups(['post_id','post_type'])`), each with `fields{name:value}`,
+  `keys{name:key}`, `types{name:type}` — values read by **field key** through `get_field()` so
+  they travel the `_`-reference rows like the front end (a corrupted reference reads `null` here
+  as it renders nothing there); `verify=1` adds `state{}` per field from
+  `sitebridge_acf_field_state()`. Unformatted by default so the shape round-trips into the POST
+  route (image = attachment ID); `format=1` runs ACF's formatting filters inside a per-group
+  try/catch — a fataling theme filter lands as `error` on that group, the request still returns.
+  `block_only_groups[]` lists block-only groups (`sitebridge_acf_group_block_only_blocks()`, the
+  helper the v1.20 write guard now shares) whose block is actually in the post's content
+  (`has_block()`), by key/title/blocks with NO values — those live in block JSON. No allowlist,
+  no post-type assumptions: which fields matter is the caller's judgment. Read-only by
+  construction (no option/transient/meta writes).
 - **Cache purge** (v1.15+): `POST /purge-cache` — optional `url` (path or absolute; per-URL purge
   where the engine supports it) and/or `post_id` (resolves permalink + `clean_post_cache`); neither
   = full-site purge. Detects and fires: WP Engine, Kinsta, W3TC, WP Rocket, WP Super Cache,
@@ -218,7 +239,7 @@ of untouched siblings, the add/remove round-trip, and regressions on remove-link
 nav change. It does NOT replace a live pass on staging — real ACF serialization and the theme's
 render are out of its reach.
 
-`php tests/acf-fields-acceptance.php` — 65 assertions over the `/acf-fields` route with an ACF
+`php tests/acf-fields-acceptance.php` — 89 assertions over the `/acf-fields` routes with an ACF
 storage emulation faithful to real persistence (value rows, `_`-reference rows holding field
 keys, repeater count + `{name}_{i}_{sub}` rows, **and ACF's own shrink cleanup** — the stub
 deletes rows `[new..old)` for registered sub-fields, as `acf-field-repeater.php::delete_row`
@@ -227,7 +248,12 @@ acceptance criteria in logic form, reference-row repair (healed + skipped), the 
 all-or-nothing input validation, null normalization, and the stale-row sweep (orphans ACF can't
 see, the same-prefix sibling field it must not touch, `clear_stale_rows:false`), and the v1.20
 block-level guard (block sub-field + repeater refused with zero meta writes, all-or-nothing,
-page-level and mixed-location groups still writable). Its live
+page-level and mixed-location groups still writable), and (v1.22) the GET route — the stub's
+`get_field()` now resolves through the reference rows like the front end (corrupted reference →
+null) and rebuilds repeater rows from row meta: raw values + keys/types, every read by key with
+`format_value=false`, zero meta writes, `verify` state, block-only group listed only when its
+block is in the content, `group` filter by key/title + 404, `format=1` with a fataling filter
+degrading to a per-group `error`. Its live
 assumptions (sub-field keys resolve individually via `acf_get_field()`; composite keys return
 false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 
