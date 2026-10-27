@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.22.0
+ * Version:     1.22.1
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.22.0' );
+define( 'SITEBRIDGE_VERSION', '1.22.1' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -2177,6 +2177,25 @@ function sitebridge_acf_block_only_group( $field ) {
 }
 
 /**
+ * The REAL registered field behind a possibly clone-flattened one. ACF's
+ * acf_get_fields() returns a seamless clone's sub-fields with composite keys
+ * ("field_<clone>_field_<sub>"); the real field is the last "field_…" segment.
+ * Returns the real field (with the caller's name preserved) or the input
+ * unchanged when the key isn't composite or the tail doesn't resolve.
+ */
+function sitebridge_acf_real_field( $field ) {
+	if ( empty( $field['key'] ) || substr_count( $field['key'], 'field_' ) < 2 ) {
+		return $field;
+	}
+	$tail = 'field_' . substr( $field['key'], strrpos( $field['key'], 'field_' ) + 6 );
+	$real = function_exists( 'acf_get_field' ) ? acf_get_field( $tail ) : false;
+	if ( ! $real || empty( $real['key'] ) ) {
+		return $field;
+	}
+	return $real;
+}
+
+/**
  * The block names a field group is located on, IF every OR-branch of its
  * location rules carries a `block == …` rule (block-only group); null for a
  * page-level, mixed-location, or undeterminable group. Shared by the write
@@ -2326,11 +2345,23 @@ function sitebridge_acf_fields_read_rest( WP_REST_Request $req ) {
 				if ( empty( $field['key'] ) || empty( $field['name'] ) ) {
 					continue;
 				}
-				$entry['types'][ $field['name'] ]  = isset( $field['type'] ) ? $field['type'] : '';
-				$entry['keys'][ $field['name'] ]   = $field['key'];
-				$entry['fields'][ $field['name'] ] = get_field( $field['key'], $post_id, $format );
+				// v1.22.1: a seamless clone's sub-fields arrive from acf_get_fields()
+				// with COMPOSITE keys ("{cloneKey}_{subKey}") — the Escondido canary
+				// read every hero field as null because get_field() by a composite
+				// key resolves nothing outside ACF's clone-loading context (the
+				// same fact the write route refuses to write through). Reading by
+				// NAME resolves through the post's "_{name}" reference row to the
+				// REAL field, whether or not the clone prefixes names; the key we
+				// report is that real key (what set_acf_fields accepts), falling
+				// back to the composite only if the tail doesn't resolve.
+				$real = sitebridge_acf_real_field( $field );
+				$entry['types'][ $field['name'] ]  = isset( $real['type'] ) ? $real['type'] : ( isset( $field['type'] ) ? $field['type'] : '' );
+				$entry['keys'][ $field['name'] ]   = $real['key'];
+				$entry['fields'][ $field['name'] ] = ( substr_count( $field['key'], 'field_' ) > 1 )
+					? get_field( $field['name'], $post_id, $format )   // composite: only the reference row can resolve it
+					: get_field( $field['key'], $post_id, $format );
 				if ( $verify ) {
-					$entry['state'][ $field['name'] ] = sitebridge_acf_field_state( $post_id, $field );
+					$entry['state'][ $field['name'] ] = sitebridge_acf_field_state( $post_id, array_merge( $real, array( 'name' => $field['name'] ) ) );
 				}
 			}
 		} catch ( \Throwable $e ) {

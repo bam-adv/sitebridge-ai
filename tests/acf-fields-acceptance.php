@@ -377,6 +377,19 @@ function get_field( $selector, $post_id = false, $format_value = true ) {
 	if ( ! $field ) {
 		return null;
 	}
+	if ( substr_count( $field['key'], 'field_' ) > 1 && $selector === $field['key'] ) {
+		return null; // composite key: unresolvable outside the clone loading context (real ACF)
+	}
+	if ( $selector === $field['name'] ) {
+		// by NAME: ACF resolves through the post's reference row to whatever
+		// real field that key names (acf_get_reference → acf_get_field)
+		$ref = meta_get( '_' . $selector );
+		$via = $ref ? acf_get_field( $ref ) : false;
+		if ( ! $via ) {
+			return null;
+		}
+		$field = $via;
+	}
 	$name = $field['name'];
 	if ( meta_get( '_' . $name ) !== $field['key'] ) {
 		return null;
@@ -464,6 +477,25 @@ function acf_get_fields( $group ) {
 }
 acf_register_test_field( array(
 	'key' => 'field_6aaa00000001', 'name' => 'hero_eyebrow', 'type' => 'text', 'parent' => 'group_page_hero',
+) );
+// The real-site shape (Escondido canary, 2026-10-27): the "Pages" group pulls
+// the Hero Banner group in as a SEAMLESS CLONE, so acf_get_fields(group) hands
+// back the hero fields with COMPOSITE keys and bare names. Values must still
+// read (by name → reference row → real field) and the reported key must be
+// the REAL one.
+$GLOBALS['acf_groups']['group_pages_clone'] = array(
+	'key' => 'group_pages_clone', 'title' => 'Pages (clone)',
+	'location' => array( array( array( 'param' => 'post_type', 'operator' => '==', 'value' => 'page' ) ) ),
+);
+acf_register_test_field( array(
+	'key' => 'field_617af16e582f3_field_61531e0536f8f', 'name' => 'show_hero_banner', 'type' => 'true_false', 'parent' => 'group_pages_clone',
+) );
+acf_register_test_field( array(
+	'key' => 'field_617af16e582f3_field_61bce16ca13a6', 'name' => 'hero_banner_badges', 'type' => 'repeater', 'parent' => 'group_pages_clone',
+	'sub_fields' => array( array( 'key' => 'field_617af16e582f3_field_61bce179a13a7', 'name' => 'badge_image', 'type' => 'image' ) ),
+) );
+acf_register_test_field( array(
+	'key' => 'field_617af16e582f3_field_deadbeef00000', 'name' => 'hero_ghost', 'type' => 'text', 'parent' => 'group_pages_clone',
 ) );
 acf_register_test_field( array(
 	'key'        => 'field_6aaa00000002',
@@ -753,9 +785,25 @@ ok( $hero['fields']['show_hero_banner'] === '1', 'true_false read raw (stored "1
 ok( $hero['fields']['hero_banner_badges'] === array( array( 'badge_image' => '4001' ), array( 'badge_image' => '4225' ) ), 'repeater rows rebuilt from row meta, image as raw attachment ID' );
 ok( $hero['keys']['hero_banner_badges'] === 'field_61bce16ca13a6' && $hero['types']['hero_banner_badges'] === 'repeater', 'keys + types map names to real field keys and types' );
 ok( ! isset( $hero['state'] ), 'verify off by default: no per-field state' );
-$all_by_key = array_filter( $GLOBALS['get_field_calls'], function ( $c ) { return strpos( $c[0], 'field_' ) === 0 && $c[2] === false; } );
-ok( count( $all_by_key ) === count( $GLOBALS['get_field_calls'] ), 'every get_field() call is by FIELD KEY with format_value=false' );
+$calls = $GLOBALS['get_field_calls'];
+ok( count( array_filter( $calls, function ( $c ) { return $c[2] === false; } ) ) === count( $calls ), 'every get_field() call has format_value=false' );
+$by_key  = array_filter( $calls, function ( $c ) { return strpos( $c[0], 'field_' ) === 0; } );
+$by_name = array_filter( $calls, function ( $c ) { return strpos( $c[0], 'field_' ) !== 0; } );
+ok( count( $by_key ) > 0 && count( array_filter( $by_key, function ( $c ) { return substr_count( $c[0], 'field_' ) > 1; } ) ) === 0, 'page-level fields are read by their REAL key — never by a composite key' );
+ok( count( $by_name ) === 3, 'only the clone-flattened (composite-key) fields are read by NAME (v1.22.1)' );
 ok( meta_snapshot() === $before, 'zero meta writes during a read' );
+
+echo "\n\033[1mscenario: v1.22.1 seamless-clone sub-fields (composite keys) read by name, real key reported\033[0m\n";
+meta_reset( healthy_seed(), $CONTENT );
+$r = sitebridge_acf_fields_read_rest( req( array( 'post_id' => 42, 'group' => 'group_pages_clone', 'verify' => true ) ) );
+ok( ! is_wp_error( $r ) && count( $r['groups'] ) === 1, 'clone-bearing group read' );
+$pg = $r['groups'][0];
+ok( $pg['fields']['show_hero_banner'] === '1', 'composite-keyed true_false reads its value (was null on the canary)' );
+ok( $pg['fields']['hero_banner_badges'] === array( array( 'badge_image' => '4001' ), array( 'badge_image' => '4225' ) ), 'composite-keyed repeater reads its rows' );
+ok( $pg['keys']['show_hero_banner'] === 'field_61531e0536f8f' && $pg['keys']['hero_banner_badges'] === 'field_61bce16ca13a6', 'keys report the REAL field keys, not the composites' );
+ok( $pg['types']['hero_banner_badges'] === 'repeater', 'type comes from the real field' );
+ok( $pg['fields']['hero_ghost'] === null && $pg['keys']['hero_ghost'] === 'field_617af16e582f3_field_deadbeef00000', 'composite whose tail does not resolve: null value, composite key kept' );
+ok( $pg['state']['hero_banner_badges']['reference_ok'] === true && count( $pg['state']['hero_banner_badges']['rows'] ) === 2, 'verify state computed against the real field' );
 
 echo "\n\033[1mscenario: read reflects reference-row truth (corrupted reference reads empty)\033[0m\n";
 $seed = healthy_seed();
