@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.22.1
+ * Version:     1.22.2
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.22.1' );
+define( 'SITEBRIDGE_VERSION', '1.22.2' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -38,9 +38,14 @@ if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
 // PUBLIC key only. Each release .zip is signed with the matching PRIVATE key,
 // which is held offline by the maintainer and never lives in this repo. The
 // updater refuses to install any release whose .zip does not verify against
-// this key (fail-closed). Key rotation = ship a manual plugin update carrying
-// the new public key here, then sign all later releases with the new key.
-const SITEBRIDGE_UPDATE_PUBKEY = 'YN/8ey9X7JLyGQEp6binEwL3tQrJTLTYp+dxjjsuZOE=';
+// this key (fail-closed). Key rotation = ship a release carrying the new public
+// key here, SIGNED WITH THE OLD KEY (sites verify it with the key they have),
+// then sign all later releases with the new key.
+//
+// Rotated 2026-10-27 (v1.22.2): the previous key was exposed in a chat
+// transcript during the v1.22.0 release. v1.22.2 is the last release signed
+// with it; v1.22.3+ must verify against this key.
+const SITEBRIDGE_UPDATE_PUBKEY = 'wyqOSyyz1b6q9WHI1q7T0+4jnC54bBWpJO2ovTeWmd4=';
 
 // --- Schema storage (kept as legacy keys for data compatibility) -------------
 const SITEBRIDGE_SCHEMA_META_KEY        = '_bam_schema_jsonld';

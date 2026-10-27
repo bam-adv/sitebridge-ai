@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.22.1**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.22.2**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -33,7 +33,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.22.1)
+## REST surface (v1.22.2)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -333,8 +333,12 @@ signature they can't forge defends a compromised release channel.)
 
 Every release from v1.11.0 on **must** be signed or sites refuse it. Existing v1.10.0 installs upgrade
 to v1.11.0 without verification (old updater) — that's the graceful cutover; they verify everything
-after. **Key rotation:** ship a manual plugin update carrying a new `SITEBRIDGE_UPDATE_PUBKEY`, then
-sign all later releases with the matching new private key.
+after. **Key rotation:** ship a release carrying a new `SITEBRIDGE_UPDATE_PUBKEY`, **signed with the
+old key** (that's what installed sites verify against), then sign all later releases with the new
+private key. Done once so far — **v1.22.2 (2026-10-27)**: the original key was exposed in a chat
+transcript; v1.22.2 is the last release signed with it, v1.22.3+ verify against the new key. A site
+that skips v1.22.2 (e.g. installed fresh from an older zip) will refuse everything after it until
+it is manually updated to ≥1.22.2.
 
 ## Deployment / fleet — intentionally NOT listed here
 
