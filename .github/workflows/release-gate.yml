@@ -10,7 +10,13 @@
 #  - release published/edited: both equal the tag, AND the release carries
 #    sitebridge-ai.zip + sitebridge-ai.zip.sig, the zip's plugin file is
 #    byte-identical to the tagged source, and the .sig verifies against the
-#    embedded SITEBRIDGE_UPDATE_PUBKEY (what every site checks before install).
+#    SITEBRIDGE_UPDATE_PUBKEY that installed sites HOLD — i.e. the key embedded
+#    in the PREVIOUS release's source. That is the same key as this release's
+#    except during a key rotation, where the rotation release carries the new
+#    key but must be signed with the old one (v1.22.2, 2026-10-27, was flagged
+#    by the pre-rotation-aware gate for exactly this). The key in this release's
+#    own source is also accepted, so a first release or a re-sign with the new
+#    key still passes.
 name: Release gate
 
 on:
@@ -29,6 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags + history: the gate needs the previous release's source
 
       - name: Read the version the source declares
         id: src
@@ -85,17 +93,45 @@ jobs:
           php-version: '8.2'
           extensions: sodium
 
-      - name: Signature verifies against the embedded public key
+      - name: Signature verifies against the key installed sites hold
         if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
+          # The key sites verify with is the one in the PREVIOUS release's source.
+          PREV=$(git tag --list 'v*' --sort=-v:refname | grep -vx "$TAG" | head -1 || true)
+          if [ -n "$PREV" ]; then
+            git show "$PREV:sitebridge-ai.php" > /tmp/rel/prev.php
+            echo "previous release: $PREV"
+          else
+            echo "no previous release tag — only this release's own key applies"
+            cp sitebridge-ai.php /tmp/rel/prev.php
+          fi
           php -r '
-            $src = file_get_contents( "sitebridge-ai.php" );
-            if ( ! preg_match( "/SITEBRIDGE_UPDATE_PUBKEY\s*=\s*\x27([^\x27]+)\x27/", $src, $m ) ) { fwrite( STDERR, "no SITEBRIDGE_UPDATE_PUBKEY in source\n" ); exit( 1 ); }
-            $pk  = base64_decode( $m[1], true );
+            $key = function ( $file ) {
+              $src = file_get_contents( $file );
+              if ( ! preg_match( "/SITEBRIDGE_UPDATE_PUBKEY\s*=\s*\x27([^\x27]+)\x27/", $src, $m ) ) { fwrite( STDERR, "no SITEBRIDGE_UPDATE_PUBKEY in $file\n" ); exit( 1 ); }
+              $pk = base64_decode( $m[1], true );
+              if ( $pk === false || strlen( $pk ) !== SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES ) { fwrite( STDERR, "SITEBRIDGE_UPDATE_PUBKEY in $file is not a valid key\n" ); exit( 1 ); }
+              return array( $m[1], $pk );
+            };
+            list( $held_b64, $held ) = $key( "/tmp/rel/prev.php" );   // what sites verify with
+            list( $new_b64,  $new  ) = $key( "sitebridge-ai.php" );   // what this release ships
             $sig = base64_decode( trim( file_get_contents( "/tmp/rel/sitebridge-ai.zip.sig" ) ), true );
             $zip = file_get_contents( "/tmp/rel/sitebridge-ai.zip" );
-            if ( $pk === false || $sig === false || strlen( $pk ) !== SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES ) { fwrite( STDERR, "pubkey or signature is not valid base64\n" ); exit( 1 ); }
-            if ( ! sodium_crypto_sign_verify_detached( $sig, $zip, $pk ) ) { fwrite( STDERR, "sitebridge-ai.zip.sig does NOT verify against SITEBRIDGE_UPDATE_PUBKEY — every site will refuse this release\n" ); exit( 1 ); }
+            if ( $sig === false ) { fwrite( STDERR, "signature is not valid base64\n" ); exit( 1 ); }
+            $ok_held = sodium_crypto_sign_verify_detached( $sig, $zip, $held );
+            $ok_new  = sodium_crypto_sign_verify_detached( $sig, $zip, $new );
+            if ( $held_b64 !== $new_b64 ) {
+              echo "KEY ROTATION: this release embeds a new SITEBRIDGE_UPDATE_PUBKEY\n";
+              if ( ! $ok_held ) {
+                fwrite( STDERR, "rotation release must be signed with the PREVIOUS key (the one installed sites hold) — it does not verify against it, so every site will refuse it" . ( $ok_new ? " (it was signed with the NEW key instead)" : "" ) . "\n" );
+                exit( 1 );
+              }
+              echo "signature verifies against the previous key — sites will accept it and switch to the new key\n";
+              exit( 0 );
+            }
+            if ( ! $ok_held ) { fwrite( STDERR, "sitebridge-ai.zip.sig does NOT verify against SITEBRIDGE_UPDATE_PUBKEY — every site will refuse this release\n" ); exit( 1 ); }
             echo "signature verifies\n";
           '
