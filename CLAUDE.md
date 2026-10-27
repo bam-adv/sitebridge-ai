@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.22.0**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.22.1**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -33,7 +33,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.22.0)
+## REST surface (v1.22.1)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -157,6 +157,14 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   (`has_block()`), by key/title/blocks with NO values — those live in block JSON. No allowlist,
   no post-type assumptions: which fields matter is the caller's judgment. Read-only by
   construction (no option/transient/meta writes).
+  **v1.22.1** — the Escondido canary read every hero field as `null`: the theme's Hero Banner
+  group is a **seamless clone** inside "Pages"/"Problems", and `acf_get_fields(group)` returns
+  clone sub-fields with COMPOSITE keys (`field_<clone>_field_<sub>`), which `get_field()` by key
+  can't resolve outside ACF's clone-loading context (the same fact the write route refuses to
+  write through). Composite-keyed fields are now read **by name** — ACF resolves a name through
+  the post's `_{name}` reference row to the real field, prefixed clone or not — and `keys{}`
+  reports the REAL key (`sitebridge_acf_real_field()`: last `field_…` segment, when it
+  resolves), i.e. what `set_acf_fields` accepts. Non-composite fields are still read by key.
 - **Cache purge** (v1.15+): `POST /purge-cache` — optional `url` (path or absolute; per-URL purge
   where the engine supports it) and/or `post_id` (resolves permalink + `clean_post_cache`); neither
   = full-site purge. Detects and fires: WP Engine, Kinsta, W3TC, WP Rocket, WP Super Cache,
@@ -239,7 +247,7 @@ of untouched siblings, the add/remove round-trip, and regressions on remove-link
 nav change. It does NOT replace a live pass on staging — real ACF serialization and the theme's
 render are out of its reach.
 
-`php tests/acf-fields-acceptance.php` — 89 assertions over the `/acf-fields` routes with an ACF
+`php tests/acf-fields-acceptance.php` — 98 assertions over the `/acf-fields` routes with an ACF
 storage emulation faithful to real persistence (value rows, `_`-reference rows holding field
 keys, repeater count + `{name}_{i}_{sub}` rows, **and ACF's own shrink cleanup** — the stub
 deletes rows `[new..old)` for registered sub-fields, as `acf-field-repeater.php::delete_row`
@@ -253,7 +261,9 @@ page-level and mixed-location groups still writable), and (v1.22) the GET route 
 null) and rebuilds repeater rows from row meta: raw values + keys/types, every read by key with
 `format_value=false`, zero meta writes, `verify` state, block-only group listed only when its
 block is in the content, `group` filter by key/title + 404, `format=1` with a fataling filter
-degrading to a per-group `error`. Its live
+degrading to a per-group `error`; (v1.22.1) a clone-flattened group with composite keys — values
+read by name, real keys reported, an unresolvable composite reads null and keeps its key — with
+the stub's by-name `get_field()` resolving through the reference row as ACF does. Its live
 assumptions (sub-field keys resolve individually via `acf_get_field()`; composite keys return
 false) were verified against ACF PRO 6.8.4 on a live install 2026-08-13.
 
