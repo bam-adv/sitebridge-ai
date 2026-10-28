@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.22.2
+ * Version:     1.22.3
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.22.2' );
+define( 'SITEBRIDGE_VERSION', '1.22.3' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -162,6 +162,23 @@ add_filter( 'auto_update_plugin', function ( $update, $item ) {
  * a missing/bad/unverifiable signature aborts the install and logs a notice.
  * -------------------------------------------------------------------------- */
 
+/**
+ * The detached-signature URL for a GitHub release ASSET package: the sibling
+ * "<package>.sig" on the same release. Returns '' for anything that is not a
+ * .zip under https://github.com/<repo>/releases/download/<tag>/ (e.g. a
+ * source zipball), so the caller falls back to the release listing.
+ */
+function sitebridge_sig_url_for_package( $package ) {
+	$prefix = 'https://github.com/' . SITEBRIDGE_GH_REPO . '/releases/download/';
+	if ( ! is_string( $package ) || strpos( $package, $prefix ) !== 0 ) {
+		return '';
+	}
+	if ( strtolower( substr( $package, -4 ) ) !== '.zip' ) {
+		return '';
+	}
+	return $package . '.sig';
+}
+
 // Find a release asset URL whose name ends with $suffix (e.g. '.zip', '.sig').
 function sitebridge_release_asset( $release, $suffix ) {
 	if ( empty( $release->assets ) || ! is_array( $release->assets ) ) {
@@ -192,6 +209,14 @@ function sitebridge_verify_before_download( $reply, $package, $upgrader, $hook_e
 		// corrected release on GitHub — must be visible on the next check, not
 		// after the cache expires (bit culliganla.com in the v1.19.0 incident).
 		delete_transient( 'sitebridge_latest_release' );
+		// v1.22.3: also drop WordPress's own cached package URL for this plugin,
+		// so the next update check re-derives package + version from the fresh
+		// release instead of retrying a stale package for up to 12 hours.
+		$up = get_site_transient( 'update_plugins' );
+		if ( is_object( $up ) && isset( $up->response[ plugin_basename( __FILE__ ) ] ) ) {
+			unset( $up->response[ plugin_basename( __FILE__ ) ] );
+			set_site_transient( 'update_plugins', $up );
+		}
 		return new WP_Error( 'sitebridge_bad_signature', 'SiteBridge AI update refused: ' . $why );
 	};
 
@@ -203,10 +228,21 @@ function sitebridge_verify_before_download( $reply, $package, $upgrader, $hook_e
 		return $refuse( 'the embedded public key is invalid.' );
 	}
 
-	$release = sitebridge_get_latest_release();
-	$sig_url = $release ? sitebridge_release_asset( $release, '.zip.sig' ) : '';
-	if ( $sig_url === '' && $release ) {
-		$sig_url = sitebridge_release_asset( $release, '.sig' );
+	// v1.22.3: the signature must come from the SAME release as $package. The
+	// package URL was fixed by WordPress's update check (from whatever release
+	// was cached then); re-reading "latest" here could name a NEWER release once
+	// the 6-hour cache rolled over — two releases an hour apart on 2026-10-27
+	// made sites verify v1.22.1's zip against v1.22.2's .sig and refuse a valid
+	// update. GitHub release assets live at
+	// .../releases/download/<tag>/<asset>, so the sibling .sig is $package.sig;
+	// the release listing is only a fallback for a non-asset package.
+	$sig_url = sitebridge_sig_url_for_package( $package );
+	if ( $sig_url === '' ) {
+		$release = sitebridge_get_latest_release();
+		$sig_url = $release ? sitebridge_release_asset( $release, '.zip.sig' ) : '';
+		if ( $sig_url === '' && $release ) {
+			$sig_url = sitebridge_release_asset( $release, '.sig' );
+		}
 	}
 	if ( $sig_url === '' ) {
 		return $refuse( 'no ".sig" signature asset was found on the release.' );

@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.22.2**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.22.3**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -33,7 +33,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.22.2)
+## REST surface (v1.22.3)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -296,6 +296,15 @@ past_due, the sweep, and the v1.19.1 rollback hardening (a demoted copy → `sch
 nothing staged). Its live assumptions (DP 4.7 meta keys and hook order) were read from the 4.7
 source 2026-09-08; the spec's live acceptance pass on one real post is still the release gate.
 
+`php tests/updater-acceptance.php` — 16 assertions over `sitebridge_verify_before_download()` with
+in-memory transients, URL-keyed `download_url()`/`wp_remote_get()` stubs and a throwaway Ed25519
+keypair patched into the plugin source before load. Reproduces the 2026-10-27 stale-package
+refusal (package on release A, cached "latest" on B → must verify against A's own `.sig`, never
+consult the listing), a genuinely bad signature still refused with the release cache AND this
+plugin's `update_plugins` entry dropped (others untouched), the zipball fallback to the listing,
+and `sitebridge_sig_url_for_package()` (asset → sibling `.sig`; zipball / foreign host / non-zip
+→ none).
+
 `php tests/capability-acceptance.php` — 96 assertions over the capability-findings route, five
 subprocess scenarios (profile-a-shaped, no-ACF, builder, schema-fetch fallback, section failure).
 Every scenario asserts read-only at the SQL/options layer and that `get_field()` is never called.
@@ -313,7 +322,19 @@ signature refusal deletes that transient, so once the operator publishes a corre
 the next update check re-polls GitHub fresh — the admin notice's "confirm the release .zip is
 signed, then retry" actually works. Before this, a retry kept hitting the cached (broken)
 release listing for up to 6 hours (bit culliganla.com during the 2026-09-09 v1.19.0→v1.19.1
-incident). No test touches the updater yet; if one ever does, cover this cache-bust.
+incident).
+
+**v1.22.3 — the signature comes from the SAME release as the package.** WordPress's update check
+fixes the package URL from whatever release was cached at that moment; the verifier used to
+re-read "latest" for the `.sig`, so once the 6-hour cache rolled over to a newer release it
+checked release A's zip against release B's signature and refused a valid update (2026-10-27:
+v1.22.1 and v1.22.2 an hour apart; Columbus, Hall's staging and others showed the "tampered or
+unsigned" notice while Escondido, with cleaner timing, updated). Now
+`sitebridge_sig_url_for_package()` derives `<package>.sig` for any asset under
+`github.com/<repo>/releases/download/<tag>/`, the release listing is only a fallback for a
+non-asset package, and a refusal also drops this plugin's entry from the `update_plugins` site
+transient so the next check re-derives package + version instead of retrying a stale package
+for up to 12 hours. `tests/updater-acceptance.php` reproduces the incident.
 
 ### Signed releases (required since v1.11.0)
 
