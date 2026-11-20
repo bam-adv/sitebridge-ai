@@ -1,6 +1,6 @@
 # SiteBridge AI — repo notes for Claude
 
-Single-file WordPress plugin (`sitebridge-ai.php`, **v1.22.2**) that bridges AI tooling to any
+Single-file WordPress plugin (`sitebridge-ai.php`, **v1.23.0**) that bridges AI tooling to any
 WordPress site over REST. Scope: **JSON-LD schema**, **desktop ACF navigation**, **managed
 redirects**, **byte-exact content search/replace**, **Yoast meta (canonical/robots +
 title/description/focus keyword)**, **cache purging**, **safe ACF page-level (meta-box) field
@@ -33,7 +33,7 @@ coordinated connector release. The connector's tool docs reference this plugin i
 (`v1.4+` / `v1.5+` / `v1.9.0+`) — all the same lineage; normalize those in the connector repo when
 you next touch tool descriptions, not here.
 
-## REST surface (v1.22.2)
+## REST surface (v1.23.0)
 
 Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
 - **Schema**: `…/template/(post_type)` per-post-type JSON-LD templates + per-post schema.
@@ -62,9 +62,37 @@ Namespaces: `SITEBRIDGE_NS` / `SITEBRIDGE_SCHEMA_NS` (both `bam/*`).
   way to add a second blank-titled column, since a blank/whitespace `column_title` normalizes to
   `""` and either matches the existing `""` column or 409s as ambiguous. It can't be combined with
   `column_index`; `add-link` now also returns the resulting `column_index`.
-- **Redirects**: `/redirects` — `GET` list, `POST` add (`source`, `target`, `type`), `DELETE` remove
-  by `source`; `/redirects/import` (`POST`: `redirects`/`csv`, `replace_all`). Stored in the
-  `bam_redirects` option.
+- **Redirects**: `/redirects` — `GET` list, `POST` add (`source`, `target`, `type`, `dry_run`),
+  `DELETE` remove by `source`; `/redirects/import` (`POST`: `redirects`/`csv`, `replace_all`,
+  `dry_run`); `/redirects/chains` (`GET`, read-only, v1.23). Stored in the `bam_redirects` option.
+  **v1.23 — chain-safe writes.** Add, import and the admin page all go through one pure planner,
+  `sitebridge_redirects_plan()`, applied entry by entry to a copy of the list: (1) **resolve** —
+  a target that is itself an exact-rule source is followed to the end and the final URL stored
+  (`resolved[]`); (2) **refuse** self-redirects and anything that returns to the source or cycles
+  (409 `self_redirect` / `redirect_loop` with the `chain`; an import with any refusal writes
+  NOTHING); (3) **flatten** — every existing X → A becomes X → final when A → … is written
+  (`flattened[]` of `{source, old_target, new_target, via}`); (4) upsert. Matching
+  (`sitebridge_redirects_norm_path`, also used by the front-end `template_redirect` matcher)
+  ignores trailing slash, case, www, http/https, relative vs absolute, and percent-encoding
+  (decoded up to 3 layers), after stripping invisible characters raw or encoded (U+FFFC,
+  zero-width, BOM, NBSP, soft hyphen, controls — `sitebridge_redirects_strip_invisible`). A host
+  other than the site's (www-insensitive) is never treated as the same URL. **Targets are stored
+  absolute** (`sitebridge_redirects_absolute`): same-site targets rebuilt on `home_url()` with
+  `user_trailingslashit()` (no slash on file paths or `$n` captures), so an http/www variant or a
+  missing slash can't add a canonical hop; legit `%20` survives (`sitebridge_redirects_scrub`
+  removes only invisible sequences). Each flattened/resolved rule records the normalized paths it
+  was routed past in `via[]`; `DELETE` returns `inbound[]` (rules still targeting the source),
+  `flattened_through[]` (rules whose `via` contains it) and a `warning` — the restore-a-post case,
+  where the caller decides. `dry_run:true` on add/import returns the same report (`rules[]` with
+  `action` add/update, `flattened[]`, `resolved[]`) and writes nothing. `/redirects/chains`
+  returns `clean`, `chains[]` (`source`, `hop_count`, `hops[]`, `final`), `loops[]`,
+  `self_redirects[]`, plus format debt that does NOT affect `clean`: `non_absolute_targets[]`
+  (pre-1.23 rows) and `duplicate_sources[]` (rows that collide under the new normalization), and
+  `regex_rules_skipped` — regex SOURCES are never chain hops or flatten targets (a pattern has no
+  single URL); regex TARGETS without `$n` are resolved/flattened like any other. To fix existing
+  chains, re-import each chain's `source` with its `final` as target. Responses only ever ADD
+  keys; `saved`/`updated`/`redirect`/`count` and `imported`/`added`/`updated`/`skipped`/`total`
+  are unchanged, so older connectors keep working.
 - **Content search/replace** (v1.13+): `POST /search-replace` — byte-exact `str_replace()` on **raw**
   `post_content`. Reads via `$wpdb->get_var` (no `the_content`, no client content), writes via raw
   `$wpdb->update` + `clean_post_cache` — deliberately NOT `wp_update_post()`, which re-normalizes ACF
@@ -275,6 +303,15 @@ file while it was being written). Covers byte-exact escape matching + the 40-byt
 composition with `expect`), the no-`occurrence` regression, and (v1.21) `near_match` for every
 kind — compact / pretty / unescaped / whitespace (NBSP) / combined — plus null on genuine absence,
 absence of the key on `found > 0` rows, and presence on an `expect`-aborted row.
+
+`php tests/redirects-acceptance.php` — 59 assertions over the redirects module with an in-memory
+options table: the five 2026-11-20 acceptance tests (flatten on insert, resolve to final, loop /
+self refusal incl. in-batch loops and all-or-nothing import, normalized matching — slash / www /
+case / http(s) / relative / raw and percent-encoded U+FFFC / zero-width / double encoding, other
+host NOT matched — and the chains report incl. fixing via re-import), absolute-target storage,
+`dry_run` on both writers (zero option writes), the delete warning (`inbound` vs
+`flattened_through`), and regressions (invalid regex, in-place update, regex sources never
+flatten).
 
 `php tests/purge-acceptance.php` — the purge route's NitroPack branch, one subprocess per
 `function_exists()`/`defined()` state (present/connected, disconnected, API-throws, legacy

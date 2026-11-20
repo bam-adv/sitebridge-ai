@@ -4,7 +4,7 @@
  * Plugin URI:  https://github.com/bam-adv/sitebridge-ai
  * Update URI:  https://github.com/bam-adv/sitebridge-ai
  * Description: Bridges AI tooling (the wp-mcp-hosted connector) to any WordPress site — JSON-LD schema, desktop ACF navigation, and managed redirects, all over REST. Self-updates from GitHub releases.
- * Version:     1.22.2
+ * Version:     1.23.0
  * Author:      Devon Moore
  * Text Domain: sitebridge-ai
  */
@@ -27,7 +27,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * SiteBridge-branded; only their values stay legacy.
  * ========================================================================== */
 
-define( 'SITEBRIDGE_VERSION', '1.22.2' );
+define( 'SITEBRIDGE_VERSION', '1.23.0' );
 
 // --- Self-update source: set this to your GitHub "owner/repo" ----------------
 if ( ! defined( 'SITEBRIDGE_GH_REPO' ) ) {
@@ -1169,13 +1169,160 @@ function sitebridge_nav_rest_remove_item( WP_REST_Request $req ) {
  * REDIRECTS MODULE  (301/302 store + template_redirect hook + REST + admin UI)
  * ========================================================================== */
 
-function sitebridge_redirects_norm_path( $url ) {
-	$path = parse_url( (string) $url, PHP_URL_PATH );
-	if ( $path === null || $path === false ) {
-		$path = (string) $url;
+/* ----------------------------------------------------------------------------
+ * v1.23 — chain-safe redirects.
+ *
+ * Every write (REST add, REST import, admin page) goes through one planner,
+ * sitebridge_redirects_plan(), which works on a copy of the stored list and
+ * only touches the option when nothing in the batch failed and dry_run is off:
+ *
+ *   1. RESOLVE  — a target that is itself an exact-rule source is followed to
+ *                 its end and the FINAL URL is stored (A → B with B → C stores
+ *                 A → C; the response's `resolved[]` says so).
+ *   2. REFUSE   — a self-redirect, or any chain that comes back to the source
+ *                 or cycles, is refused (409 `redirect_loop` / `self_redirect`).
+ *                 A batch with any refusal writes nothing.
+ *   3. FLATTEN  — every existing rule X → A is rewritten to X → final when
+ *                 A → … is added, and listed in `flattened[]`.
+ *   4. NORMALIZE— sources and targets are compared regardless of trailing
+ *                 slash, case, www, http/https, relative vs absolute form and
+ *                 percent-encoding, with invisible characters (U+FFFC object
+ *                 replacement, zero-width, BOM, NBSP, soft hyphen, controls…)
+ *                 stripped — raw or percent-encoded.
+ *   5. ABSOLUTE — targets are stored as absolute URLs. Same-site targets are
+ *                 rebuilt on home_url() (so http:// or www. variants don't cost
+ *                 an extra canonical hop) with the permalink trailing slash.
+ *
+ * Each rewritten rule records the intermediate URLs it was flattened through
+ * in `via` (normalized paths), so deleting a redirect — typically because the
+ * post is being restored — can report every rule that used to lead there
+ * (`inbound[]` + `flattened_through[]`), and the caller decides.
+ *
+ * Regex ("regex:") rules: their targets are made absolute and resolved like
+ * any other unless they use $n capture references; their sources are never
+ * flattened into (a pattern has no single URL) and they are not followed as
+ * chain hops — /redirects/chains counts them as `regex_rules_skipped`.
+ * ------------------------------------------------------------------------- */
+
+/** Strip invisible / format / control characters (raw UTF-8). */
+function sitebridge_redirects_strip_invisible( $s ) {
+	$s   = (string) $s;
+	$out = @preg_replace(
+		'/[\x{0000}-\x{001F}\x{007F}-\x{009F}\x{00A0}\x{00AD}\x{034F}\x{061C}\x{115F}\x{1160}\x{17B4}\x{17B5}\x{180E}\x{2000}-\x{200F}\x{2028}-\x{202F}\x{205F}-\x{206F}\x{3000}\x{3164}\x{FE00}-\x{FE0F}\x{FEFF}\x{FFA0}\x{FFF0}-\x{FFFC}]/u',
+		'',
+		$s
+	);
+	if ( $out === null ) {
+		// Not valid UTF-8 — byte-level fallback for the common offenders.
+		$out = str_replace(
+			array( "\xEF\xBF\xBC", "\xE2\x80\x8B", "\xE2\x80\x8C", "\xE2\x80\x8D", "\xE2\x80\x8E", "\xE2\x80\x8F", "\xE2\x81\xA0", "\xEF\xBB\xBF", "\xC2\xA0", "\xC2\xAD" ),
+			'',
+			$s
+		);
+		$out = preg_replace( '/[\x00-\x1F\x7F]/', '', $out );
 	}
-	$path = rtrim( '/' . ltrim( $path, '/' ), '/' );
-	return strtolower( $path === '' ? '/' : $path );
+	return $out;
+}
+
+/**
+ * Storage scrub: strip invisible characters whether raw or percent-encoded,
+ * WITHOUT decoding anything else (a legitimate %20 stays %20).
+ */
+function sitebridge_redirects_scrub( $s ) {
+	$s = sitebridge_redirects_strip_invisible( $s );
+	$s = preg_replace_callback( '/(?:%[0-9A-Fa-f]{2})+/', function ( $m ) {
+		$decoded = rawurldecode( $m[0] );
+		$clean   = sitebridge_redirects_strip_invisible( $decoded );
+		if ( $clean === $decoded ) {
+			return $m[0];
+		}
+		$enc = '';
+		for ( $i = 0, $n = strlen( $clean ); $i < $n; $i++ ) {
+			$enc .= '%' . strtoupper( bin2hex( $clean[ $i ] ) );
+		}
+		return $enc;
+	}, $s );
+	return trim( (string) $s );
+}
+
+/** Percent-decode (up to 3 layers, for double-encoded paths) and strip invisibles. */
+function sitebridge_redirects_decode( $s ) {
+	$s = (string) $s;
+	for ( $i = 0; $i < 3 && preg_match( '/%[0-9A-Fa-f]{2}/', $s ); $i++ ) {
+		$s = rawurldecode( $s );
+	}
+	return trim( sitebridge_redirects_strip_invisible( $s ) );
+}
+
+/** Host of home_url(), lowercased, without a leading www. */
+function sitebridge_redirects_site_host() {
+	static $memo = array();
+	$home = home_url( '/' );
+	if ( ! isset( $memo[ $home ] ) ) {
+		$memo[ $home ] = preg_replace( '/^www\./', '', strtolower( (string) parse_url( $home, PHP_URL_HOST ) ) );
+	}
+	return $memo[ $home ];
+}
+
+/** home_url()'s path prefix ('' for a root install). */
+function sitebridge_redirects_home_prefix() {
+	$p = (string) parse_url( home_url( '/' ), PHP_URL_PATH );
+	return rtrim( $p, '/' );
+}
+
+/**
+ * Split a source/target into parts. `internal` is true for relative URLs and
+ * absolute URLs on this site's host (www or not, any scheme).
+ */
+function sitebridge_redirects_split( $url ) {
+	$url = sitebridge_redirects_scrub( $url );
+	// "www.site.com/x" or "site.com/x" with no scheme → treat as protocol-relative.
+	if ( $url !== '' && $url[0] !== '/' && ! preg_match( '#^[a-z][a-z0-9+.\-]*://#i', $url ) ) {
+		$first = strtolower( (string) strtok( $url, '/?#' ) );
+		$bare  = preg_replace( '/^www\./', '', preg_replace( '/:\d+$/', '', $first ) );
+		if ( strpos( $first, 'www.' ) === 0 || $bare === sitebridge_redirects_site_host() ) {
+			$url = '//' . $url;
+		}
+	}
+	$p    = parse_url( $url );
+	$host = ( is_array( $p ) && isset( $p['host'] ) ) ? strtolower( $p['host'] ) : null;
+	$path = ( is_array( $p ) && isset( $p['path'] ) ) ? $p['path'] : ( is_array( $p ) ? '' : $url );
+	return array(
+		'host'     => $host,
+		'scheme'   => ( is_array( $p ) && isset( $p['scheme'] ) ) ? strtolower( $p['scheme'] ) : null,
+		'internal' => $host === null || preg_replace( '/^www\./', '', $host ) === sitebridge_redirects_site_host(),
+		'path'     => $path,
+		'query'    => ( is_array( $p ) && isset( $p['query'] ) ) ? $p['query'] : null,
+		'fragment' => ( is_array( $p ) && isset( $p['fragment'] ) ) ? $p['fragment'] : null,
+	);
+}
+
+/**
+ * Normalized comparison path: decoded, invisible-stripped, leading slash, no
+ * trailing slash, lowercased. Host, scheme, query and fragment are ignored —
+ * callers check `internal` separately where the host matters.
+ */
+function sitebridge_redirects_norm_path( $url ) {
+	// Memoized per request: the front-end matcher normalizes every stored rule
+	// on every page load. Keyed on input + host so a home_url change can't serve
+	// a stale key; capped so a pathological request can't grow it unbounded.
+	static $memo = array();
+	$mk = sitebridge_redirects_site_host() . "\n" . (string) $url;
+	if ( isset( $memo[ $mk ] ) ) {
+		return $memo[ $mk ];
+	}
+	if ( count( $memo ) > 5000 ) {
+		$memo = array();
+	}
+	return $memo[ $mk ] = sitebridge_redirects_norm_path_uncached( $url );
+}
+
+function sitebridge_redirects_norm_path_uncached( $url ) {
+	$parts = sitebridge_redirects_split( $url );
+	$path  = sitebridge_redirects_decode( $parts['path'] );
+	$path  = rtrim( '/' . ltrim( $path, '/' ), '/' );
+	$path  = $path === '' ? '/' : $path;
+	return function_exists( 'mb_strtolower' ) ? mb_strtolower( $path, 'UTF-8' ) : strtolower( $path );
 }
 
 /** If a source uses the "regex:" prefix, return the bare pattern; else null. */
@@ -1202,37 +1349,262 @@ function sitebridge_redirects_key( $source ) {
 	return sitebridge_redirects_norm_path( $source );
 }
 
+/** True when a target uses regex capture references ($1 / ${1}). */
+function sitebridge_redirects_has_captures( $target ) {
+	return (bool) preg_match( '/\$\{?[0-9]/', (string) $target );
+}
+
+/**
+ * Key of the page a target lands on, for chain-following: the normalized path
+ * when the target is on this site, null when it is external or uses captures.
+ */
+function sitebridge_redirects_target_key( $target ) {
+	if ( sitebridge_redirects_has_captures( $target ) ) {
+		return null;
+	}
+	$parts = sitebridge_redirects_split( $target );
+	return $parts['internal'] ? sitebridge_redirects_norm_path( $target ) : null;
+}
+
+/**
+ * The one storage format for targets: an absolute URL. Same-site targets are
+ * rebuilt on home_url() with the permalink trailing slash, so neither a
+ * scheme/www variant nor a missing slash costs an extra canonical hop.
+ */
+function sitebridge_redirects_absolute( $target ) {
+	$target = sitebridge_redirects_scrub( $target );
+	if ( $target === '' ) {
+		return '';
+	}
+	$parts = sitebridge_redirects_split( $target );
+	if ( ! $parts['internal'] ) {
+		return strpos( $target, '//' ) === 0 ? 'https:' . $target : $target;
+	}
+	$path = (string) $parts['path'];
+	$path = '/' . ltrim( $path, '/' );
+	$pre  = sitebridge_redirects_home_prefix();
+	if ( $pre !== '' && ( $path === $pre || strpos( $path, $pre . '/' ) === 0 ) ) {
+		$path = substr( $path, strlen( $pre ) );
+		$path = $path === '' ? '/' : $path;
+	}
+	$last = basename( $path );
+	if ( $path !== '/' && strpos( $last, '.' ) === false && ! sitebridge_redirects_has_captures( $path ) ) {
+		$path = function_exists( 'user_trailingslashit' ) ? user_trailingslashit( rtrim( $path, '/' ) ) : $path;
+	}
+	$url = home_url( $path );
+	if ( $parts['query'] !== null ) {
+		$url .= '?' . $parts['query'];
+	}
+	if ( $parts['fragment'] !== null ) {
+		$url .= '#' . $parts['fragment'];
+	}
+	return $url;
+}
+
 function sitebridge_redirects_all() {
 	$r = get_option( SITEBRIDGE_REDIRECTS_OPTION, array() );
 	return is_array( $r ) ? $r : array();
 }
 
-/** Shared add/update logic (used by REST and the admin page). Returns the entry. */
-function sitebridge_redirects_save( $source, $target, $type = 301 ) {
-	$type = in_array( (int) $type, array( 301, 302, 307, 308 ), true ) ? (int) $type : 301;
-	$redirects = sitebridge_redirects_all();
-	$pattern = sitebridge_redirects_regex_pattern( $source );
-	if ( $pattern !== null && ! sitebridge_redirects_regex_valid( $pattern ) ) {
-		return array( 'error' => 'invalid_regex', 'entry' => null, 'updated' => false, 'count' => count( $redirects ) );
-	}
-	$key   = sitebridge_redirects_key( $source );
-	$entry = array( 'source' => $source, 'target' => $target, 'type' => $type, 'created' => current_time( 'mysql' ) );
-	if ( $pattern !== null ) {
-		$entry['regex'] = true;
-	}
-	$replaced = false;
-	foreach ( $redirects as $i => $r ) {
-		if ( sitebridge_redirects_key( isset( $r['source'] ) ? $r['source'] : '' ) === $key ) {
-			$redirects[ $i ] = $entry;
-			$replaced = true;
-			break;
+function sitebridge_redirects_valid_type( $type ) {
+	return in_array( (int) $type, array( 301, 302, 307, 308 ), true ) ? (int) $type : 301;
+}
+
+/** Index of the exact rule whose source matches $key in $list, or -1. */
+function sitebridge_redirects_find( $list, $key ) {
+	foreach ( $list as $i => $r ) {
+		if ( isset( $r['source'] ) && sitebridge_redirects_key( $r['source'] ) === $key ) {
+			return $i;
 		}
 	}
-	if ( ! $replaced ) {
-		$redirects[] = $entry;
+	return -1;
+}
+
+/**
+ * Follow $target through the exact rules in $list. $source_key (the rule being
+ * written) counts as already visited: reaching it is a loop.
+ * Returns {final, via[] (intermediate keys), hops[] (rule sources followed), error|null}.
+ */
+function sitebridge_redirects_resolve( $list, $target, $source_key ) {
+	$cur  = sitebridge_redirects_absolute( $target );
+	$seen = array();
+	if ( $source_key !== null ) {
+		$seen[ $source_key ] = true;
 	}
-	update_option( SITEBRIDGE_REDIRECTS_OPTION, array_values( $redirects ) );
-	return array( 'entry' => $entry, 'updated' => $replaced, 'count' => count( $redirects ) );
+	$via   = array();
+	$hops  = array();
+	$chain = array( $cur );
+	for ( $n = 0; $n < 50; $n++ ) {
+		$k = sitebridge_redirects_target_key( $cur );
+		if ( $k === null ) {
+			break;
+		}
+		if ( isset( $seen[ $k ] ) ) {
+			$error = ( $k === $source_key && empty( $hops ) ) ? 'self_redirect' : 'redirect_loop';
+			return array( 'final' => $cur, 'via' => $via, 'hops' => $hops, 'chain' => $chain, 'error' => $error );
+		}
+		$seen[ $k ] = true;
+		$i = sitebridge_redirects_find( $list, $k );
+		if ( $i < 0 || empty( $list[ $i ]['target'] ) ) {
+			break;
+		}
+		$via[]   = $k;
+		$hops[]  = $list[ $i ]['source'];
+		$cur     = sitebridge_redirects_absolute( $list[ $i ]['target'] );
+		$chain[] = $cur;
+	}
+	if ( $n >= 50 ) {
+		return array( 'final' => $cur, 'via' => $via, 'hops' => $hops, 'chain' => $chain, 'error' => 'redirect_loop' );
+	}
+	return array( 'final' => $cur, 'via' => $via, 'hops' => $hops, 'chain' => $chain, 'error' => null );
+}
+
+/**
+ * The planner every write goes through. Applies $entries in order to a copy of
+ * $list (resolve → refuse → flatten → upsert). Pure: never reads or writes the
+ * option. When `errors` is non-empty the caller must write nothing.
+ */
+function sitebridge_redirects_plan( $list, $entries ) {
+	$list = array_values( is_array( $list ) ? $list : array() );
+	$out  = array(
+		'added' => 0, 'updated' => 0, 'skipped' => 0, 'skipped_details' => array(),
+		'rules' => array(), 'flattened' => array(), 'resolved' => array(), 'errors' => array(),
+	);
+	foreach ( array_values( (array) $entries ) as $n => $e ) {
+		$e      = is_array( $e ) ? $e : array();
+		$source = isset( $e['source'] ) ? sitebridge_redirects_scrub( $e['source'] ) : '';
+		$raw_t  = isset( $e['target'] ) ? trim( (string) $e['target'] ) : '';
+		$type   = sitebridge_redirects_valid_type( isset( $e['type'] ) ? $e['type'] : 301 );
+		if ( $source === '' || sitebridge_redirects_scrub( $raw_t ) === '' ) {
+			$out['skipped']++;
+			$out['skipped_details'][] = array( 'index' => $n, 'source' => $source, 'reason' => 'source and target are required' );
+			continue;
+		}
+		$pattern = sitebridge_redirects_regex_pattern( $source );
+		if ( $pattern !== null && ! sitebridge_redirects_regex_valid( $pattern ) ) {
+			$out['skipped']++;
+			$out['skipped_details'][] = array( 'index' => $n, 'source' => $source, 'reason' => 'invalid_regex' );
+			continue;
+		}
+		$key = sitebridge_redirects_key( $source );
+
+		// 1–2. Resolve the target to its end; refuse self-redirects and loops.
+		if ( sitebridge_redirects_has_captures( $raw_t ) ) {
+			$res = array( 'final' => sitebridge_redirects_absolute( $raw_t ), 'via' => array(), 'hops' => array(), 'chain' => array(), 'error' => null );
+		} else {
+			$res = sitebridge_redirects_resolve( $list, $raw_t, $pattern === null ? $key : null );
+		}
+		if ( $res['error'] !== null ) {
+			$out['errors'][] = array(
+				'index'  => $n,
+				'source' => $source,
+				'target' => $raw_t,
+				'code'   => $res['error'],
+				'chain'  => array_merge( array( $source ), $res['chain'] ),
+				'message' => $res['error'] === 'self_redirect'
+					? 'Source and target are the same URL.'
+					: 'This redirect would create a loop: ' . implode( ' → ', array_merge( array( $source ), $res['chain'] ) ),
+			);
+			continue;
+		}
+		$final     = $res['final'];
+		$final_key = sitebridge_redirects_target_key( $final );
+		if ( ! empty( $res['via'] ) ) {
+			$out['resolved'][] = array( 'source' => $source, 'requested_target' => $raw_t, 'via' => $res['hops'], 'stored_target' => $final );
+		}
+
+		// 3. Flatten: every exact rule X → (this source) now points at the final target.
+		if ( $pattern === null ) {
+			foreach ( $list as $i => $r ) {
+				if ( empty( $r['source'] ) || empty( $r['target'] ) || sitebridge_redirects_key( $r['source'] ) === $key ) {
+					continue;
+				}
+				if ( sitebridge_redirects_target_key( $r['target'] ) !== $key ) {
+					continue;
+				}
+				if ( $final_key !== null && sitebridge_redirects_regex_pattern( $r['source'] ) === null
+					&& sitebridge_redirects_key( $r['source'] ) === $final_key ) {
+					// Guard (resolution should already have refused this): X → X.
+					$out['errors'][] = array( 'index' => $n, 'source' => $source, 'target' => $raw_t, 'code' => 'redirect_loop',
+						'chain' => array( $r['source'], $source, $final ),
+						'message' => 'Flattening ' . $r['source'] . ' would make it redirect to itself.' );
+					continue 2;
+				}
+				$old                  = $r['target'];
+				$list[ $i ]['target'] = $final;
+				$list[ $i ]['via']    = array_values( array_unique( array_merge(
+					isset( $r['via'] ) && is_array( $r['via'] ) ? $r['via'] : array(),
+					array( $key ),
+					$res['via']
+				) ) );
+				$out['flattened'][] = array( 'source' => $r['source'], 'old_target' => $old, 'new_target' => $final, 'via' => $source );
+			}
+		}
+
+		// 4. Upsert.
+		$entry = array( 'source' => $source, 'target' => $final, 'type' => $type, 'created' => current_time( 'mysql' ) );
+		if ( $pattern !== null ) {
+			$entry['regex'] = true;
+		}
+		if ( ! empty( $res['via'] ) ) {
+			$entry['via'] = $res['via'];
+		}
+		$i = sitebridge_redirects_find( $list, $key );
+		if ( $i >= 0 ) {
+			$list[ $i ] = $entry;
+			$out['updated']++;
+			$out['rules'][] = array_merge( array( 'action' => 'update' ), $entry );
+		} else {
+			$list[] = $entry;
+			$out['added']++;
+			$out['rules'][] = array_merge( array( 'action' => 'add' ), $entry );
+		}
+	}
+	$out['list']  = array_values( $list );
+	$out['total'] = count( $out['list'] );
+	return $out;
+}
+
+/** Shared add/update logic (REST + admin page). */
+function sitebridge_redirects_save( $source, $target, $type = 301, $dry_run = false ) {
+	$plan = sitebridge_redirects_plan( sitebridge_redirects_all(), array( array( 'source' => $source, 'target' => $target, 'type' => $type ) ) );
+	if ( ! empty( $plan['errors'] ) ) {
+		return array( 'error' => $plan['errors'][0]['code'], 'detail' => $plan['errors'][0], 'entry' => null, 'updated' => false, 'count' => count( sitebridge_redirects_all() ) );
+	}
+	if ( $plan['skipped'] > 0 ) {
+		return array( 'error' => $plan['skipped_details'][0]['reason'] === 'invalid_regex' ? 'invalid_regex' : 'bad_input', 'entry' => null, 'updated' => false, 'count' => count( sitebridge_redirects_all() ) );
+	}
+	if ( ! $dry_run ) {
+		update_option( SITEBRIDGE_REDIRECTS_OPTION, $plan['list'] );
+	}
+	$rule = $plan['rules'][0];
+	unset( $rule['action'] );
+	return array(
+		'entry'     => $rule,
+		'updated'   => $plan['updated'] > 0,
+		'count'     => $plan['total'],
+		'flattened' => $plan['flattened'],
+		'resolved'  => empty( $plan['resolved'] ) ? null : $plan['resolved'][0],
+		'dry_run'   => (bool) $dry_run,
+	);
+}
+
+/** Rules that lead to $source: directly (target) or historically (flattened through it). */
+function sitebridge_redirects_leading_to( $list, $source ) {
+	$key     = sitebridge_redirects_key( $source );
+	$inbound = array();
+	$through = array();
+	foreach ( $list as $r ) {
+		if ( empty( $r['source'] ) || sitebridge_redirects_key( $r['source'] ) === $key ) {
+			continue;
+		}
+		if ( ! empty( $r['target'] ) && sitebridge_redirects_target_key( $r['target'] ) === $key ) {
+			$inbound[] = $r;
+		} elseif ( isset( $r['via'] ) && is_array( $r['via'] ) && in_array( $key, $r['via'], true ) ) {
+			$through[] = $r;
+		}
+	}
+	return array( 'inbound' => $inbound, 'flattened_through' => $through );
 }
 
 /** Shared delete logic. Returns number removed. */
@@ -1245,6 +1617,85 @@ function sitebridge_redirects_remove( $source ) {
 	} ) );
 	update_option( SITEBRIDGE_REDIRECTS_OPTION, $redirects );
 	return $before - count( $redirects );
+}
+
+/**
+ * Every chain, loop and self-redirect among the stored exact rules, plus
+ * stored-format debt (non-absolute targets, duplicate sources). Read-only.
+ */
+function sitebridge_redirects_chains( $list = null ) {
+	$list   = $list === null ? sitebridge_redirects_all() : array_values( $list );
+	$chains = array(); $loops = array(); $self = array(); $loop_seen = array();
+	$non_abs = array(); $dups = array(); $by_key = array(); $regex = 0;
+	foreach ( $list as $r ) {
+		if ( empty( $r['source'] ) ) {
+			continue;
+		}
+		if ( sitebridge_redirects_regex_pattern( $r['source'] ) !== null ) {
+			$regex++;
+		} else {
+			$by_key[ sitebridge_redirects_key( $r['source'] ) ][] = $r['source'];
+		}
+		if ( ! empty( $r['target'] ) && ! preg_match( '#^https?://#i', (string) $r['target'] ) ) {
+			$non_abs[] = array( 'source' => $r['source'], 'target' => $r['target'] );
+		}
+	}
+	foreach ( $by_key as $k => $sources ) {
+		if ( count( $sources ) > 1 ) {
+			$dups[] = array( 'key' => $k, 'sources' => $sources );
+		}
+	}
+	foreach ( $list as $r ) {
+		if ( empty( $r['source'] ) || empty( $r['target'] ) || sitebridge_redirects_regex_pattern( $r['source'] ) !== null ) {
+			continue;
+		}
+		$k0 = sitebridge_redirects_key( $r['source'] );
+		if ( sitebridge_redirects_target_key( $r['target'] ) === $k0 ) {
+			$self[] = array( 'source' => $r['source'], 'target' => $r['target'] );
+			continue;
+		}
+		$path = array( array( 'source' => $r['source'], 'target' => $r['target'] ) );
+		$seen = array( $k0 => 0 );
+		$cur  = $r['target'];
+		while ( true ) {
+			$k = sitebridge_redirects_target_key( $cur );
+			if ( $k === null ) {
+				break;
+			}
+			if ( isset( $seen[ $k ] ) ) {
+				$cycle = array_map( function ( $h ) { return $h['source']; }, array_slice( $path, $seen[ $k ] ) );
+				$sig   = $cycle;
+				sort( $sig );
+				$sig = implode( '|', array_map( 'sitebridge_redirects_key', $sig ) );
+				if ( ! isset( $loop_seen[ $sig ] ) ) {
+					$loop_seen[ $sig ] = true;
+					$loops[] = array( 'cycle' => $cycle );
+				}
+				$path = null;
+				break;
+			}
+			$i = sitebridge_redirects_find( $list, $k );
+			if ( $i < 0 || empty( $list[ $i ]['target'] ) ) {
+				break;
+			}
+			$seen[ $k ] = count( $path );
+			$path[]     = array( 'source' => $list[ $i ]['source'], 'target' => $list[ $i ]['target'] );
+			$cur        = $list[ $i ]['target'];
+		}
+		if ( $path !== null && count( $path ) > 1 ) {
+			$chains[] = array( 'source' => $r['source'], 'hop_count' => count( $path ), 'hops' => $path, 'final' => sitebridge_redirects_absolute( $cur ) );
+		}
+	}
+	return array(
+		'clean'                => empty( $chains ) && empty( $loops ) && empty( $self ),
+		'chains'               => $chains,
+		'loops'                => $loops,
+		'self_redirects'       => $self,
+		'non_absolute_targets' => $non_abs,
+		'duplicate_sources'    => $dups,
+		'regex_rules_skipped'  => $regex,
+		'total_rules'          => count( $list ),
+	);
 }
 
 // Fire matching redirects on the front end, early.
@@ -1263,7 +1714,7 @@ add_action( 'template_redirect', function () {
 		$raw_path = '/';
 	}
 
-	// Pass 1: exact-path rules (fast, trailing-slash/case tolerant).
+	// Pass 1: exact-path rules (normalized: slash/case/encoding/invisible-char tolerant).
 	foreach ( $redirects as $r ) {
 		if ( empty( $r['source'] ) || empty( $r['target'] ) ) {
 			continue;
@@ -1272,7 +1723,7 @@ add_action( 'template_redirect', function () {
 			continue; // regex rules run in pass 2
 		}
 		if ( sitebridge_redirects_norm_path( $r['source'] ) === $req ) {
-			$type = in_array( (int) ( isset( $r['type'] ) ? $r['type'] : 301 ), array( 301, 302, 307, 308 ), true ) ? (int) $r['type'] : 301;
+			$type = sitebridge_redirects_valid_type( isset( $r['type'] ) ? $r['type'] : 301 );
 			wp_redirect( (string) $r['target'], $type );
 			exit;
 		}
@@ -1296,7 +1747,7 @@ add_action( 'template_redirect', function () {
 			for ( $i = min( count( $m ) - 1, 9 ); $i >= 1; $i-- ) {
 				$target = str_replace( array( '${' . $i . '}', '$' . $i ), $m[ $i ], $target );
 			}
-			$type = in_array( (int) ( isset( $r['type'] ) ? $r['type'] : 301 ), array( 301, 302, 307, 308 ), true ) ? (int) $r['type'] : 301;
+			$type = sitebridge_redirects_valid_type( isset( $r['type'] ) ? $r['type'] : 301 );
 			wp_redirect( $target, $type );
 			exit;
 		}
@@ -1312,9 +1763,10 @@ add_action( 'rest_api_init', function () {
 			'callback'            => 'sitebridge_redirects_rest_add',
 			'permission_callback' => $perm,
 			'args'                => array(
-				'source' => array( 'required' => true,  'type' => 'string' ),
-				'target' => array( 'required' => true,  'type' => 'string' ),
-				'type'   => array( 'required' => false, 'type' => 'integer' ),
+				'source'  => array( 'required' => true,  'type' => 'string' ),
+				'target'  => array( 'required' => true,  'type' => 'string' ),
+				'type'    => array( 'required' => false, 'type' => 'integer' ),
+				'dry_run' => array( 'required' => false, 'type' => 'boolean' ),
 			),
 		),
 		array(
@@ -1332,7 +1784,13 @@ add_action( 'rest_api_init', function () {
 			'redirects'   => array( 'required' => false ),
 			'csv'         => array( 'required' => false, 'type' => 'string' ),
 			'replace_all' => array( 'required' => false, 'type' => 'boolean' ),
+			'dry_run'     => array( 'required' => false, 'type' => 'boolean' ),
 		),
+	) );
+	register_rest_route( SITEBRIDGE_NS, '/redirects/chains', array(
+		'methods'             => 'GET',
+		'callback'            => 'sitebridge_redirects_rest_chains',
+		'permission_callback' => $perm,
 	) );
 } );
 
@@ -1341,17 +1799,40 @@ function sitebridge_redirects_rest_list() {
 	return array( 'count' => count( $redirects ), 'redirects' => array_values( $redirects ) );
 }
 
+function sitebridge_redirects_rest_chains() {
+	return array_merge( array( 'plugin_version' => SITEBRIDGE_VERSION ), sitebridge_redirects_chains() );
+}
+
+function sitebridge_redirects_loop_error( $err ) {
+	return new WP_Error( $err['code'], $err['message'], array( 'status' => 409, 'source' => $err['source'], 'target' => $err['target'], 'chain' => $err['chain'] ) );
+}
+
 function sitebridge_redirects_rest_add( WP_REST_Request $req ) {
 	$source = trim( (string) $req['source'] );
 	$target = trim( (string) $req['target'] );
 	if ( $source === '' || $target === '' ) {
 		return new WP_Error( 'bad_input', 'source and target are required', array( 'status' => 400 ) );
 	}
-	$res = sitebridge_redirects_save( $source, $target, $req['type'] !== null ? $req['type'] : 301 );
+	$dry = ! empty( $req['dry_run'] );
+	$res = sitebridge_redirects_save( $source, $target, $req['type'] !== null ? $req['type'] : 301, $dry );
 	if ( ! empty( $res['error'] ) ) {
-		return new WP_Error( 'invalid_regex', 'The "regex:" source pattern does not compile', array( 'status' => 400 ) );
+		if ( isset( $res['detail'] ) ) {
+			return sitebridge_redirects_loop_error( $res['detail'] );
+		}
+		if ( $res['error'] === 'invalid_regex' ) {
+			return new WP_Error( 'invalid_regex', 'The "regex:" source pattern does not compile', array( 'status' => 400 ) );
+		}
+		return new WP_Error( 'bad_input', 'source and target are required', array( 'status' => 400 ) );
 	}
-	return array( 'saved' => true, 'updated' => $res['updated'], 'redirect' => $res['entry'], 'count' => $res['count'] );
+	return array(
+		'saved'     => ! $dry,
+		'dry_run'   => $dry,
+		'updated'   => $res['updated'],
+		'redirect'  => $res['entry'],
+		'count'     => $res['count'],
+		'flattened' => $res['flattened'],
+		'resolved'  => $res['resolved'],
+	);
 }
 
 function sitebridge_redirects_rest_delete( WP_REST_Request $req ) {
@@ -1360,49 +1841,25 @@ function sitebridge_redirects_rest_delete( WP_REST_Request $req ) {
 		return new WP_Error( 'bad_input', 'source is required', array( 'status' => 400 ) );
 	}
 	$deleted = sitebridge_redirects_remove( $source );
-	return array( 'deleted' => $deleted, 'source' => $source, 'count' => count( sitebridge_redirects_all() ) );
+	$lead    = sitebridge_redirects_leading_to( sitebridge_redirects_all(), $source );
+	$out     = array( 'deleted' => $deleted, 'source' => $source, 'count' => count( sitebridge_redirects_all() ) );
+	$out['inbound']           = $lead['inbound'];
+	$out['flattened_through'] = $lead['flattened_through'];
+	$n = count( $lead['inbound'] ) + count( $lead['flattened_through'] );
+	$out['warning'] = $n > 0
+		? sprintf( '%d other rule(s) lead to %s: `inbound` still targets it; `flattened_through` were repointed past it when it was redirected. Review them — if this URL is live again they may belong back on it.', $n, $source )
+		: null;
+	return $out;
 }
 
-/** Bulk import: one read + one write. Merges by source path; returns counts. */
-function sitebridge_redirects_import( $entries ) {
-	$existing = sitebridge_redirects_all();
-	$index = array();
-	foreach ( $existing as $i => $r ) {
-		$index[ sitebridge_redirects_key( isset( $r['source'] ) ? $r['source'] : '' ) ] = $i;
+/** Bulk import: one read + one write (none on dry_run or any refusal). */
+function sitebridge_redirects_import( $entries, $replace_all = false, $dry_run = false ) {
+	$plan = sitebridge_redirects_plan( $replace_all ? array() : sitebridge_redirects_all(), $entries );
+	if ( empty( $plan['errors'] ) && ! $dry_run ) {
+		update_option( SITEBRIDGE_REDIRECTS_OPTION, $plan['list'] );
 	}
-	$added = 0; $updated = 0; $skipped = 0;
-	foreach ( $entries as $e ) {
-		$source = isset( $e['source'] ) ? trim( (string) $e['source'] ) : '';
-		$target = isset( $e['target'] ) ? trim( (string) $e['target'] ) : '';
-		$type   = isset( $e['type'] ) ? (int) $e['type'] : 301;
-		if ( ! in_array( $type, array( 301, 302, 307, 308 ), true ) ) {
-			$type = 301;
-		}
-		if ( $source === '' || $target === '' ) {
-			$skipped++;
-			continue;
-		}
-		$pattern = sitebridge_redirects_regex_pattern( $source );
-		if ( $pattern !== null && ! sitebridge_redirects_regex_valid( $pattern ) ) {
-			$skipped++;
-			continue;
-		}
-		$key   = sitebridge_redirects_key( $source );
-		$entry = array( 'source' => $source, 'target' => $target, 'type' => $type, 'created' => current_time( 'mysql' ) );
-		if ( $pattern !== null ) {
-			$entry['regex'] = true;
-		}
-		if ( isset( $index[ $key ] ) ) {
-			$existing[ $index[ $key ] ] = $entry;
-			$updated++;
-		} else {
-			$existing[] = $entry;
-			$index[ $key ] = count( $existing ) - 1;
-			$added++;
-		}
-	}
-	update_option( SITEBRIDGE_REDIRECTS_OPTION, array_values( $existing ) );
-	return array( 'added' => $added, 'updated' => $updated, 'skipped' => $skipped, 'total' => count( $existing ) );
+	unset( $plan['list'] );
+	return $plan;
 }
 
 /** Parse CSV text (source,target,type per line; optional header row) into entries. */
@@ -1438,11 +1895,16 @@ function sitebridge_redirects_rest_import( WP_REST_Request $req ) {
 	if ( empty( $entries ) ) {
 		return new WP_Error( 'bad_input', 'Provide a non-empty "redirects" array or a "csv" string', array( 'status' => 400 ) );
 	}
-	if ( ! empty( $req['replace_all'] ) ) {
-		update_option( SITEBRIDGE_REDIRECTS_OPTION, array() );
+	$dry = ! empty( $req['dry_run'] );
+	$res = sitebridge_redirects_import( $entries, ! empty( $req['replace_all'] ), $dry );
+	if ( ! empty( $res['errors'] ) ) {
+		return new WP_Error(
+			'redirect_loop',
+			sprintf( '%d entr%s would create a loop or self-redirect; nothing was written.', count( $res['errors'] ), count( $res['errors'] ) === 1 ? 'y' : 'ies' ),
+			array( 'status' => 409, 'errors' => $res['errors'] )
+		);
 	}
-	$res = sitebridge_redirects_import( $entries );
-	return array_merge( array( 'imported' => true ), $res );
+	return array_merge( array( 'imported' => ! $dry, 'dry_run' => $dry ), $res );
 }
 
 /* ============================================================================
@@ -3292,8 +3754,14 @@ function sitebridge_admin_redirects_page() {
 			$target = isset( $_POST['target'] ) ? trim( sanitize_text_field( wp_unslash( $_POST['target'] ) ) ) : '';
 			$type   = isset( $_POST['type'] ) ? (int) $_POST['type'] : 301;
 			if ( $source !== '' && $target !== '' ) {
-				$res    = sitebridge_redirects_save( $source, $target, $type );
-				$notice = $res['updated'] ? 'Redirect updated.' : 'Redirect added.';
+				$res = sitebridge_redirects_save( $source, $target, $type );
+				if ( ! empty( $res['error'] ) ) {
+					$notice = isset( $res['detail'] ) ? 'Not saved — ' . $res['detail']['message'] : 'Not saved — check the source and target.';
+				} else {
+					$notice = ( $res['updated'] ? 'Redirect updated.' : 'Redirect added.' )
+						. ( ! empty( $res['resolved'] ) ? ' Target was itself redirected, so the final URL was stored.' : '' )
+						. ( ! empty( $res['flattened'] ) ? sprintf( ' %d existing rule(s) repointed to the same final URL.', count( $res['flattened'] ) ) : '' );
+				}
 			} else {
 				$notice = 'Source and target are both required.';
 			}
@@ -3310,11 +3778,12 @@ function sitebridge_admin_redirects_page() {
 			}
 			$entries = ( $csv !== '' ) ? sitebridge_redirects_parse_csv( $csv ) : array();
 			if ( ! empty( $entries ) ) {
-				if ( ! empty( $_POST['replace_all'] ) ) {
-					update_option( SITEBRIDGE_REDIRECTS_OPTION, array() );
+				$res = sitebridge_redirects_import( $entries, ! empty( $_POST['replace_all'] ) );
+				if ( ! empty( $res['errors'] ) ) {
+					$notice = sprintf( 'Nothing imported — %d row(s) would create a loop or self-redirect (first: %s).', count( $res['errors'] ), $res['errors'][0]['message'] );
+				} else {
+					$notice = sprintf( 'Imported: %d added, %d updated, %d skipped, %d existing rule(s) flattened (%d total).', $res['added'], $res['updated'], $res['skipped'], count( $res['flattened'] ), $res['total'] );
 				}
-				$res    = sitebridge_redirects_import( $entries );
-				$notice = sprintf( 'Imported: %d added, %d updated, %d skipped (%d total).', $res['added'], $res['updated'], $res['skipped'], $res['total'] );
 			} else {
 				$notice = 'No valid rows found — upload a CSV file or paste rows (source,target,type).';
 			}
